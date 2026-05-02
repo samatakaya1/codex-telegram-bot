@@ -1,4 +1,4 @@
-type CallbackKind = 's' | 'pc' | 'a' | 'd' | 'dc';
+type CallbackKind = 's' | 'pc' | 'pn' | 'ps' | 'a' | 'd' | 'dc';
 
 type BaseStoreEntry = {
   createdAt: number;
@@ -37,7 +37,9 @@ const DEFAULT_TTL_MS = 15 * 60 * 1000;
 export class CallbackDataStore {
   private nextId = 1;
   private readonly selectChats = new Map<string, SelectChatStoreEntry>();
-  private readonly projectChats = new Map<string, StoreEntry>();
+  private readonly selectProjects = new Map<string, StoreEntry>();
+  private readonly projectNewChats = new Map<string, StoreEntry>();
+  private readonly projectSelectChats = new Map<string, StoreEntry>();
   private readonly deleteChats = new Map<string, DeleteChatStoreEntry>();
   private readonly deleteChatConfirms = new Map<string, DeleteChatConfirmStoreEntry>();
   private readonly maxEntries: number;
@@ -77,15 +79,37 @@ export class CallbackDataStore {
     return entry?.projectPath ?? null;
   }
 
-  createProjectChat(projectPath: string): string {
+  createSelectProject(projectPath: string): string {
     const key = this.createKey();
-    this.setBounded(this.projectChats, key, { value: projectPath, createdAt: this.now() });
+    this.setBounded(this.selectProjects, key, { value: projectPath, createdAt: this.now() });
     return `pc:${key}`;
   }
 
-  resolveProjectChat(callbackData: string | undefined): string | null {
+  resolveSelectProject(callbackData: string | undefined): string | null {
     const key = parseCallback(callbackData, 'pc');
-    return key === null ? null : this.getFresh(this.projectChats, key);
+    return key === null ? null : this.getFresh(this.selectProjects, key);
+  }
+
+  createProjectNewChat(projectPath: string): string {
+    const key = this.createKey();
+    this.setBounded(this.projectNewChats, key, { value: projectPath, createdAt: this.now() });
+    return `pn:${key}`;
+  }
+
+  resolveProjectNewChat(callbackData: string | undefined): string | null {
+    const key = parseCallback(callbackData, 'pn');
+    return key === null ? null : this.getFresh(this.projectNewChats, key);
+  }
+
+  createProjectSelectChat(projectPath: string): string {
+    const key = this.createKey();
+    this.setBounded(this.projectSelectChats, key, { value: projectPath, createdAt: this.now() });
+    return `ps:${key}`;
+  }
+
+  resolveProjectSelectChat(callbackData: string | undefined): string | null {
+    const key = parseCallback(callbackData, 'ps');
+    return key === null ? null : this.getFresh(this.projectSelectChats, key);
   }
 
   createDeleteChat(threadId: string, projectPath: string): string {

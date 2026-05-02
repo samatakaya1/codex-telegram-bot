@@ -18,16 +18,28 @@ describe('CallbackDataStore', () => {
     expect(store.resolveSelectChatProjectPath(callback)).toBe(projectPath);
   });
 
-  it('encodes project paths for project-chat callbacks without exposing the path', () => {
+  it('encodes project paths for project selection and action callbacks without exposing the path', () => {
     const store = new CallbackDataStore();
     const projectPath = 'C:\\Workspace\\A very long project path with spaces';
 
-    const callback = store.createProjectChat(projectPath);
+    const selectProject = store.createSelectProject(projectPath);
+    const newChat = store.createProjectNewChat(projectPath);
+    const selectChat = store.createProjectSelectChat(projectPath);
 
-    expect(callback.length).toBeLessThanOrEqual(64);
-    expect(callback.startsWith('pc:')).toBe(true);
-    expect(callback).not.toContain(projectPath);
-    expect(store.resolveProjectChat(callback)).toBe(projectPath);
+    expect(selectProject.length).toBeLessThanOrEqual(64);
+    expect(selectProject.startsWith('pc:')).toBe(true);
+    expect(selectProject).not.toContain(projectPath);
+    expect(store.resolveSelectProject(selectProject)).toBe(projectPath);
+
+    expect(newChat.length).toBeLessThanOrEqual(64);
+    expect(newChat.startsWith('pn:')).toBe(true);
+    expect(newChat).not.toContain(projectPath);
+    expect(store.resolveProjectNewChat(newChat)).toBe(projectPath);
+
+    expect(selectChat.length).toBeLessThanOrEqual(64);
+    expect(selectChat.startsWith('ps:')).toBe(true);
+    expect(selectChat).not.toContain(projectPath);
+    expect(store.resolveProjectSelectChat(selectChat)).toBe(projectPath);
   });
 
   it('encodes delete-chat callbacks without exposing thread ids or project paths', () => {
@@ -57,7 +69,9 @@ describe('CallbackDataStore', () => {
     const store = new CallbackDataStore();
 
     expect(store.resolveSelectChat('s:missing')).toBeNull();
-    expect(store.resolveProjectChat('bad')).toBeNull();
+    expect(store.resolveSelectProject('bad')).toBeNull();
+    expect(store.resolveProjectNewChat('pn:missing')).toBeNull();
+    expect(store.resolveProjectSelectChat('ps:missing')).toBeNull();
     expect(store.resolveDeleteChat('d:missing')).toBeNull();
     expect(store.resolveDeleteChatConfirm('dc:missing')).toBeNull();
   });

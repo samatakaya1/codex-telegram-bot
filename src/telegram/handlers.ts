@@ -84,6 +84,9 @@ const SUMMARY_CHAT_PROMPT =
     'Keep it brief and factual.'
   ].join(' ');
 const SUMMARY_CHAT_WORKING_MESSAGE = 'Codex is preparing chat summary...';
+const CREATE_PROJECT_CHAT_BUTTON = 'Создать новый чат';
+const SELECT_PROJECT_CHAT_BUTTON = 'Выбрать чат';
+const PROJECT_UNAVAILABLE_MESSAGE = 'This project is no longer available. Run /select_project again.';
 
 type SelectedChat = {
   threadId: string;
@@ -168,12 +171,25 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     return helpTextForState(hasSelectedProject(ctx));
   }
 
+  function noChatSelectedMessage(chatId: number): string {
+    return selectedProjectPath(chatId) === undefined
+      ? 'No chat selected. Use /select_project first, then /select_chat.'
+      : 'No chat selected. Use /new_chat to create one or /select_chat to choose an existing chat.';
+  }
+
   async function updateCommandMenu(chatId: number, hasChat: boolean): Promise<void> {
     try {
       await Promise.resolve(deps.updateCommandMenu?.(chatId, hasChat));
     } catch (error) {
       reportDeliveryError(error);
     }
+  }
+
+  function projectActionKeyboard(projectPath: string): InlineKeyboardOption {
+    return keyboard([
+      [{ text: CREATE_PROJECT_CHAT_BUTTON, callback_data: callbackData.createProjectNewChat(projectPath) }],
+      [{ text: SELECT_PROJECT_CHAT_BUTTON, callback_data: callbackData.createProjectSelectChat(projectPath) }]
+    ]);
   }
 
   async function handleStart(ctx: TelegramHandlerContext): Promise<void> {
@@ -231,27 +247,13 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     try {
-      const threads = await deps.codex.listThreads();
-      const selectedProject = normalizePathForIdentity(projectPath);
-      const projectThreads = threads.filter((thread) => {
-        const projectPath = projectPathFromThread(thread);
-        return projectPath !== undefined && normalizePathForIdentity(projectPath) === selectedProject;
-      });
-
-      if (projectThreads.length === 0) {
-        await safeReply(ctx, 'No chats for this project found. Use /new_chat to create one.');
+      const safeProject = await findSafeProject(projectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
         return;
       }
 
-      const rows = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread) => {
-        const title = displayTitleFromThread(thread) ?? 'Untitled chat';
-        return [{ text: title, callback_data: callbackData.createSelectChat(thread.id, projectPath) }];
-      });
-      const titles = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread, index) => {
-        return `${index + 1}. ${displayTitleFromThread(thread) ?? 'Untitled chat'}`;
-      });
-
-      await safeReply(ctx, `Project chats:\n${titles.join('\n')}`, keyboard(rows));
+      await replyProjectChats(ctx, safeProject.path);
     } catch {
       await safeReply(ctx, 'Could not load project chats. Check Codex app-server and try again.');
     }
@@ -271,7 +273,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
       const visible = projects.slice(0, MAX_LIST_ITEMS);
       const rows = visible.map((project) => [
-        { text: truncateLabel(project.name), callback_data: callbackData.createProjectChat(project.path) }
+        { text: truncateLabel(project.name), callback_data: callbackData.createSelectProject(project.path) }
       ]);
       const names = visible.map((project, index) => `${index + 1}. ${truncateLabel(project.name)}`);
       await safeReply(ctx, `Projects:\n${names.join('\n')}`, keyboard(rows));
@@ -292,12 +294,13 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     try {
-      const thread = await deps.codex.startThread({ cwd: projectPath });
-      const chatId = ownerChatKey(ctx);
-      setSelectedChat(chatId, thread, projectPath);
-      const refreshed = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
-      await updateCommandMenu(chatId, refreshed.projectPath !== undefined);
-      await safeReply(ctx, `Created new chat.\n${formatCurrentChat(refreshed)}`);
+      const safeProject = await findSafeProject(projectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      await createNewChatInProject(ctx, safeProject.path);
     } catch {
       await safeReply(ctx, 'Could not create a new chat for the selected project.');
     }
@@ -316,7 +319,13 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     try {
-      const projectThreads = await listProjectThreads(projectPath);
+      const safeProject = await findSafeProject(projectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      const projectThreads = await listProjectThreads(safeProject.path);
 
       if (projectThreads.length === 0) {
         await safeReply(ctx, 'No chats for this project found. Use /new_chat to create one.');
@@ -325,7 +334,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
       const rows = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread) => {
         const title = displayTitleFromThread(thread) ?? 'Untitled chat';
-        return [{ text: title, callback_data: callbackData.createDeleteChat(thread.id, projectPath) }];
+        return [{ text: title, callback_data: callbackData.createDeleteChat(thread.id, safeProject.path) }];
       });
       const titles = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread, index) => {
         return `${index + 1}. ${displayTitleFromThread(thread) ?? 'Untitled chat'}`;
@@ -358,7 +367,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
     const selected = selectedChats.get(ownerChatKey(ctx));
     if (selected === undefined) {
-      await safeReply(ctx, 'No chat selected. Use /select_project first.');
+      await safeReply(ctx, noChatSelectedMessage(ownerChatKey(ctx)));
       return;
     }
 
@@ -373,7 +382,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
     const selected = selectedChats.get(ownerChatKey(ctx));
     if (selected === undefined) {
-      await safeReply(ctx, 'No chat selected. Use /select_project first.');
+      await safeReply(ctx, noChatSelectedMessage(ownerChatKey(ctx)));
       return;
     }
 
@@ -414,9 +423,21 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       return;
     }
 
-    const projectPath = callbackData.resolveProjectChat(ctx.callbackData);
+    const projectNewChatPath = callbackData.resolveProjectNewChat(ctx.callbackData);
+    if (projectNewChatPath !== null) {
+      await handleProjectNewChatCallback(ctx, projectNewChatPath);
+      return;
+    }
+
+    const projectSelectChatPath = callbackData.resolveProjectSelectChat(ctx.callbackData);
+    if (projectSelectChatPath !== null) {
+      await handleProjectSelectChatCallback(ctx, projectSelectChatPath);
+      return;
+    }
+
+    const projectPath = callbackData.resolveSelectProject(ctx.callbackData);
     if (projectPath !== null) {
-      await handleProjectChatCallback(ctx, projectPath);
+      await handleSelectProjectCallback(ctx, projectPath);
       return;
     }
 
@@ -441,7 +462,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
     const selected = selectedChats.get(ownerChatKey(ctx));
     if (selected === undefined) {
-      await safeReply(ctx, 'No chat selected. Use /select_project first, then /select_chat.');
+      await safeReply(ctx, noChatSelectedMessage(ownerChatKey(ctx)));
       return;
     }
 
@@ -493,6 +514,30 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     if (projectPath !== undefined) {
       selectedProjects.set(chatId, projectPath);
     }
+  }
+
+  async function replyProjectChats(ctx: TelegramHandlerContext, projectPath: string): Promise<void> {
+    const threads = await deps.codex.listThreads();
+    const selectedProject = normalizePathForIdentity(projectPath);
+    const projectThreads = threads.filter((thread) => {
+      const projectPath = projectPathFromThread(thread);
+      return projectPath !== undefined && normalizePathForIdentity(projectPath) === selectedProject;
+    });
+
+    if (projectThreads.length === 0) {
+      await safeReply(ctx, 'No chats for this project found. Use /new_chat to create one.');
+      return;
+    }
+
+    const rows = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread) => {
+      const title = displayTitleFromThread(thread) ?? 'Untitled chat';
+      return [{ text: title, callback_data: callbackData.createSelectChat(thread.id, projectPath) }];
+    });
+    const titles = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread, index) => {
+      return `${index + 1}. ${displayTitleFromThread(thread) ?? 'Untitled chat'}`;
+    });
+
+    await safeReply(ctx, `Project chats:\n${titles.join('\n')}`, keyboard(rows));
   }
 
   async function refreshSelectedChat(chatId: number, selected: SelectedChat): Promise<SelectedChat> {
@@ -581,10 +626,32 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
   async function handleSelectChatCallback(ctx: TelegramHandlerContext, threadId: string): Promise<void> {
     try {
-      const thread = await deps.codex.resumeThread(threadId);
-      const projectPath = callbackData.resolveSelectChatProjectPath(ctx.callbackData) ?? projectPathFromThread(thread);
+      const callbackProjectPath = callbackData.resolveSelectChatProjectPath(ctx.callbackData);
+      if (callbackProjectPath === null) {
+        await safeReply(ctx, 'This chat button no longer has project context. Run /select_chat again.');
+        return;
+      }
+
+      const safeProject = await findSafeProject(callbackProjectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
       const chatId = ownerChatKey(ctx);
-      setSelectedChat(chatId, thread, projectPath);
+      if (!callbackMatchesSelectedProject(chatId, safeProject.path)) {
+        await safeReply(ctx, 'This chat button no longer matches the selected project. Run /select_chat again.');
+        return;
+      }
+
+      const projectThreads = await listProjectThreads(safeProject.path);
+      if (!projectThreads.some((thread) => thread.id === threadId)) {
+        await safeReply(ctx, 'This chat is no longer available. Run /select_chat again.');
+        return;
+      }
+
+      const thread = await deps.codex.resumeThread(threadId);
+      setSelectedChat(chatId, thread, safeProject.path);
       const selected = await refreshSelectedChat(chatId, selectedChats.get(chatId)!);
       await updateCommandMenu(chatId, selected.projectPath !== undefined);
       await answerCallback(ctx, 'Selected');
@@ -691,28 +758,84 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
   }
 
-  async function handleProjectChatCallback(ctx: TelegramHandlerContext, requestedProjectPath: string): Promise<void> {
+  async function findSafeProject(requestedProjectPath: string): Promise<ProjectSummary | undefined> {
+    const projects = await deps.listProjects(deps.config.projectsRoot);
+    return projects.find((project) => {
+      return normalizePathForIdentity(project.path) === normalizePathForIdentity(requestedProjectPath);
+    });
+  }
+
+  async function handleSelectProjectCallback(ctx: TelegramHandlerContext, requestedProjectPath: string): Promise<void> {
     try {
-      const projects = await deps.listProjects(deps.config.projectsRoot);
-      const safeProject = projects.find((project) => {
-        return normalizePathForIdentity(project.path) === normalizePathForIdentity(requestedProjectPath);
-      });
+      const safeProject = await findSafeProject(requestedProjectPath);
 
       if (safeProject === undefined) {
-        await safeReply(ctx, 'This project is no longer available. Run /select_project again.');
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
         return;
       }
 
-      const thread = await deps.codex.startThread({ cwd: safeProject.path });
       const chatId = ownerChatKey(ctx);
-      setSelectedChat(chatId, thread, safeProject.path);
-      const selected = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
-      await updateCommandMenu(chatId, selected.projectPath !== undefined);
-      await answerCallback(ctx, 'Created');
-      await safeReply(ctx, `Created project chat.\n${formatCurrentChat(selected)}`);
+      clearSelectedChatThread(chatId, safeProject.path);
+      await updateCommandMenu(chatId, true);
+      await answerCallback(ctx, 'Selected');
+      await safeReply(ctx, `Selected project: ${truncateLabel(safeProject.name)}`, projectActionKeyboard(safeProject.path));
     } catch {
-      await safeReply(ctx, 'Could not create project chat. Check Codex app-server and try again.');
+      await safeReply(ctx, 'Could not select project. Check the configured projects root and try again.');
     }
+  }
+
+  async function handleProjectNewChatCallback(ctx: TelegramHandlerContext, requestedProjectPath: string): Promise<void> {
+    try {
+      const safeProject = await findSafeProject(requestedProjectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      const chatId = ownerChatKey(ctx);
+      if (!callbackMatchesSelectedProject(chatId, safeProject.path)) {
+        await safeReply(ctx, 'This project action no longer matches the selected project. Run /select_project again.');
+        return;
+      }
+
+      clearSelectedChatThread(chatId, safeProject.path);
+      await answerCallback(ctx, 'Create chat');
+      await createNewChatInProject(ctx, safeProject.path);
+    } catch {
+      await safeReply(ctx, 'Could not create a new chat for the selected project.');
+    }
+  }
+
+  async function handleProjectSelectChatCallback(ctx: TelegramHandlerContext, requestedProjectPath: string): Promise<void> {
+    try {
+      const safeProject = await findSafeProject(requestedProjectPath);
+      if (safeProject === undefined) {
+        await safeReply(ctx, PROJECT_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      const chatId = ownerChatKey(ctx);
+      if (!callbackMatchesSelectedProject(chatId, safeProject.path)) {
+        await safeReply(ctx, 'This project action no longer matches the selected project. Run /select_project again.');
+        return;
+      }
+
+      clearSelectedChatThread(chatId, safeProject.path);
+      await updateCommandMenu(chatId, true);
+      await answerCallback(ctx, 'Select chat');
+      await replyProjectChats(ctx, safeProject.path);
+    } catch {
+      await safeReply(ctx, 'Could not load project chats. Check Codex app-server and try again.');
+    }
+  }
+
+  async function createNewChatInProject(ctx: TelegramHandlerContext, projectPath: string): Promise<void> {
+    const thread = await deps.codex.startThread({ cwd: projectPath });
+    const chatId = ownerChatKey(ctx);
+    setSelectedChat(chatId, thread, projectPath);
+    const refreshed = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
+    await updateCommandMenu(chatId, refreshed.projectPath !== undefined);
+    await safeReply(ctx, `Created new chat.\n${formatCurrentChat(refreshed)}`);
   }
 
   async function startCodexTurn(

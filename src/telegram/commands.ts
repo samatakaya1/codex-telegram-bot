@@ -8,7 +8,7 @@ export const BASE_TELEGRAM_COMMANDS = [
   { command: 'help', description: 'Show available commands' },
   { command: 'status', description: 'Show Codex connection status and URL' },
   { command: 'limits', description: 'Show current Codex limit remaining' },
-  { command: 'select_project', description: 'Choose a project and create a chat' },
+  { command: 'select_project', description: 'Choose a project' },
   { command: 'reboot', description: 'Restart Codex app-server and bot' }
 ] as const satisfies readonly TelegramCommandDefinition[];
 

@@ -67,7 +67,11 @@ function dependencies() {
       getRateLimits: vi.fn((): JsonValue | null => null)
     },
     readProjectlessThreadIds: vi.fn(async () => new Set(['projectless-1'])),
-    listProjects: vi.fn(async () => [{ name: 'New project', path: 'C:\\Workspace\\New project' }]),
+    listProjects: vi.fn(async () => [
+      { name: 'New project', path: 'C:\\Workspace\\New project' },
+      { name: 'Project', path: 'C:\\Workspace\\Project' },
+      { name: 'Other project', path: 'C:\\Workspace\\Other' }
+    ]),
     updateCommandMenu: vi.fn(async () => undefined)
   };
 }
@@ -210,6 +214,7 @@ describe('telegram handlers', () => {
 
   it('reports when the selected project has no listed chats', async () => {
     const deps = dependencies();
+    deps.listProjects.mockResolvedValueOnce([{ name: 'Missing', path: 'C:\\Workspace\\Missing' }]);
     const handlers = createTelegramHandlers({ config: config(), ...deps });
     handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Missing');
     const { ctx, replies, replyOptions } = makeContext();
@@ -217,6 +222,20 @@ describe('telegram handlers', () => {
     await handlers.handleProjectChats(ctx);
 
     expect(replies.join('\n')).toContain('No chats for this project found');
+    expect(JSON.stringify(replyOptions)).not.toContain('s:');
+  });
+
+  it('revalidates the selected project before listing chats from /select_chat', async () => {
+    const deps = dependencies();
+    deps.listProjects.mockResolvedValueOnce([{ name: 'Other project', path: 'C:\\Workspace\\Other' }]);
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const { ctx, replies, replyOptions } = makeContext();
+
+    await handlers.handleProjectChats(ctx);
+
+    expect(deps.codex.listThreads).not.toHaveBeenCalled();
+    expect(replies.join('\n')).toContain('no longer available');
     expect(JSON.stringify(replyOptions)).not.toContain('s:');
   });
 
@@ -231,6 +250,21 @@ describe('telegram handlers', () => {
     expect(deps.codex.archiveThread).not.toHaveBeenCalled();
     expect(replies.join('\n')).toContain('No project selected');
     expect(replies.join('\n')).toContain('/select_project');
+    expect(JSON.stringify(replyOptions)).not.toContain('d:');
+  });
+
+  it('revalidates the selected project before listing chats from /delete_chat', async () => {
+    const deps = dependencies();
+    deps.listProjects.mockResolvedValueOnce([{ name: 'Other project', path: 'C:\\Workspace\\Other' }]);
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const { ctx, replies, replyOptions } = makeContext();
+
+    await handlers.handleDeleteChat(ctx);
+
+    expect(deps.codex.listThreads).not.toHaveBeenCalled();
+    expect(deps.codex.archiveThread).not.toHaveBeenCalled();
+    expect(replies.join('\n')).toContain('no longer available');
     expect(JSON.stringify(replyOptions)).not.toContain('d:');
   });
 
@@ -431,7 +465,9 @@ describe('telegram handlers', () => {
       { id: 'long-chat', preview: longChatTitle, cwd: 'C:\\Workspace\\Project', updatedAt: 1 }
     ]);
     deps.readProjectlessThreadIds.mockResolvedValueOnce(new Set());
-    deps.listProjects.mockResolvedValueOnce([{ name: longProjectName, path: 'C:\\Workspace\\Long' }]);
+    deps.listProjects
+      .mockResolvedValueOnce([{ name: 'Project', path: 'C:\\Workspace\\Project' }])
+      .mockResolvedValueOnce([{ name: longProjectName, path: 'C:\\Workspace\\Long' }]);
     const handlers = createTelegramHandlers({ config: config(), ...deps });
     handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
 
@@ -457,7 +493,9 @@ describe('telegram handlers', () => {
   it('returns user-safe messages when dependencies fail', async () => {
     const deps = dependencies();
     deps.codex.listThreads.mockRejectedValueOnce(new Error('Codex down'));
-    deps.listProjects.mockRejectedValueOnce(new Error('scan failed'));
+    deps.listProjects
+      .mockResolvedValueOnce([{ name: 'Project', path: 'C:\\Workspace\\Project' }])
+      .mockRejectedValueOnce(new Error('scan failed'));
     const handlers = createTelegramHandlers({ config: config(), ...deps });
     handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
 
@@ -522,7 +560,8 @@ describe('telegram handlers', () => {
     const handlers = createTelegramHandlers({ config: config(), ...deps });
     const { ctx, replies } = makeContext();
 
-    const callbackData = handlers.callbackData.createSelectChat('project-1');
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const callbackData = handlers.callbackData.createSelectChat('project-1', 'C:\\Workspace\\Project');
     await handlers.handleCallback({ ...ctx, callbackData });
 
     expect(deps.codex.resumeThread).toHaveBeenCalledWith('project-1');
@@ -530,6 +569,45 @@ describe('telegram handlers', () => {
     expect(deps.updateCommandMenu).toHaveBeenCalledWith(ownerId, true);
     expect(replies.join('\n')).toContain('Selected chat');
     expect(replies.join('\n')).not.toContain('project-1');
+  });
+
+  it('rejects select chat callbacks without project context', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const callbackData = handlers.callbackData.createSelectChat('project-1');
+    const { ctx, replies } = makeContext({ callbackData });
+
+    await handlers.handleCallback(ctx);
+
+    expect(deps.codex.resumeThread).not.toHaveBeenCalled();
+    expect(replies.join('\n')).toContain('Run /select_chat again');
+  });
+
+  it('rejects select chat callbacks for a different selected project', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const callbackData = handlers.callbackData.createSelectChat('other-project-1', 'C:\\Workspace\\Other');
+    const { ctx, replies } = makeContext({ callbackData });
+
+    await handlers.handleCallback(ctx);
+
+    expect(deps.codex.resumeThread).not.toHaveBeenCalled();
+    expect(replies.join('\n')).toContain('no longer matches');
+  });
+
+  it('rejects select chat callbacks when the thread is no longer in the selected project', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    const callbackData = handlers.callbackData.createSelectChat('missing-thread', 'C:\\Workspace\\Project');
+    const { ctx, replies } = makeContext({ callbackData });
+
+    await handlers.handleCallback(ctx);
+
+    expect(deps.codex.resumeThread).not.toHaveBeenCalled();
+    expect(replies.join('\n')).toContain('no longer available');
   });
 
   it('shows the selected chat title and project from /current', async () => {
@@ -540,7 +618,11 @@ describe('telegram handlers', () => {
       cwd: 'C:\\Workspace\\Project'
     });
     const handlers = createTelegramHandlers({ config: config(), ...deps });
-    const callbackData = handlers.callbackData.createSelectChat('thread-secret');
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
+    deps.codex.listThreads.mockResolvedValueOnce([
+      { id: 'thread-secret', preview: 'Daily planning', cwd: 'C:\\Workspace\\Project', updatedAt: 1 }
+    ]);
+    const callbackData = handlers.callbackData.createSelectChat('thread-secret', 'C:\\Workspace\\Project');
     await handlers.handleCallback(makeContext({ callbackData }).ctx);
 
     const current = makeContext();
@@ -859,6 +941,32 @@ describe('telegram handlers', () => {
     expect(summary.replies.join('\n')).toContain('No chat selected');
   });
 
+  it('directs users to create or select a chat after a project is selected', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    await handlers.handleCallback(makeContext({
+      callbackData: handlers.callbackData.createSelectProject('C:\\Workspace\\Project')
+    }).ctx);
+    deps.updateCommandMenu.mockClear();
+
+    const current = makeContext();
+    await handlers.handleCurrent(current.ctx);
+
+    const summary = makeContext();
+    await handlers.handleSummaryChat(summary.ctx);
+
+    const text = makeContext({ text: 'hello' });
+    await handlers.handleText(text.ctx);
+
+    const response = `${current.replies.join('\n')}\n${summary.replies.join('\n')}\n${text.replies.join('\n')}`;
+    expect(response).toContain('No chat selected');
+    expect(response).toContain('/new_chat');
+    expect(response).toContain('/select_chat');
+    expect(response).not.toContain('Use /select_project first');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(deps.updateCommandMenu).not.toHaveBeenCalled();
+  });
+
   it('keeps active-chat commands hidden when the selected thread has no project', async () => {
     const deps = dependencies();
     const handlers = createTelegramHandlers({ config: config(), ...deps });
@@ -945,7 +1053,11 @@ describe('telegram handlers', () => {
       path: sessionPath,
       cwd: 'C:\\Workspace\\Project'
     });
+    deps.codex.listThreads.mockResolvedValueOnce([
+      { id: 'thread-with-model', preview: 'Selected model chat', cwd: 'C:\\Workspace\\Project', updatedAt: 1 }
+    ]);
     const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'selected-thread', 'C:\\Workspace\\Project');
     const callbackData = handlers.callbackData.createSelectChat('thread-with-model', 'C:\\Workspace\\Project');
     const selected = makeContext({ callbackData });
 
@@ -998,21 +1110,36 @@ describe('telegram handlers', () => {
 
   it('keeps the validated selected project when refreshing thread metadata', async () => {
     const deps = dependencies();
+    deps.listProjects.mockResolvedValue([
+      { name: 'Safe', path: 'C:\\Workspace\\Safe' }
+    ]);
     deps.codex.resumeThread.mockResolvedValueOnce({
       id: 'thread-with-stale-cwd',
       preview: 'Safe project chat',
       cwd: 'C:\\Workspace\\Safe'
     });
-    deps.codex.listThreads.mockResolvedValueOnce([
-      {
-        id: 'thread-with-stale-cwd',
-        preview: 'Safe project chat',
-        cwd: 'C:\\Outside',
-        updatedAt: 1
-      }
-    ]);
+    deps.codex.listThreads
+      .mockResolvedValueOnce([
+        {
+          id: 'thread-with-stale-cwd',
+          preview: 'Safe project chat',
+          cwd: 'C:\\Workspace\\Safe',
+          updatedAt: 1
+        }
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'thread-with-stale-cwd',
+          preview: 'Safe project chat',
+          cwd: 'C:\\Outside',
+          updatedAt: 1
+        }
+      ]);
     deps.codex.startThread.mockResolvedValueOnce({ id: 'new-thread', preview: 'New chat', cwd: 'C:\\Workspace\\Safe' });
     const handlers = createTelegramHandlers({ config: config(), ...deps });
+    await handlers.handleCallback(makeContext({
+      callbackData: handlers.callbackData.createSelectProject('C:\\Workspace\\Safe')
+    }).ctx);
     const callbackData = handlers.callbackData.createSelectChat('thread-with-stale-cwd', 'C:\\Workspace\\Safe');
     await handlers.handleCallback(makeContext({ callbackData }).ctx);
 
@@ -1292,7 +1419,11 @@ describe('telegram handlers', () => {
     const handlers = createTelegramHandlers({ config: config(), ...deps });
     const { ctx, replies } = makeContext();
 
-    const callbackData = handlers.callbackData.createSelectChat('project-1');
+    await handlers.handleCallback(makeContext({
+      callbackData: handlers.callbackData.createSelectProject('C:\\Workspace\\Project')
+    }).ctx);
+    deps.updateCommandMenu.mockClear();
+    const callbackData = handlers.callbackData.createSelectChat('project-1', 'C:\\Workspace\\Project');
     await handlers.handleCallback({ ...ctx, callbackData });
 
     expect(handlers.getSelectedThread(ownerId)).toBeNull();

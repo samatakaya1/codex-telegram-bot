@@ -18,7 +18,7 @@ function config(): AppConfig {
 }
 
 describe('chat creation integration flow', () => {
-  it('shows project buttons from select_project, creates a chat from the callback, and selects the new thread', async () => {
+  it('shows project action buttons, creates a chat from the create action, and selects the new thread', async () => {
     const replies: string[] = [];
     const replyOptions: unknown[] = [];
     const ctx: TelegramHandlerContext = {
@@ -47,19 +47,29 @@ describe('chat creation integration flow', () => {
 
     await handlers.handleSelectProject(ctx);
     const options = replyOptions[0] as {
-      reply_markup?: { inline_keyboard?: Array<Array<{ callback_data?: string }>> };
+      reply_markup?: { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> };
     };
-    const callbackData = options.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
+    const projectCallbackData = options.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data;
 
-    expect(callbackData).toBeDefined();
-    await handlers.handleCallback({ ...ctx, callbackData });
+    expect(projectCallbackData).toBeDefined();
+    await handlers.handleCallback({ ...ctx, callbackData: projectCallbackData });
+    expect(deps.codex.startThread).not.toHaveBeenCalled();
+
+    const actionOptions = replyOptions[1] as {
+      reply_markup?: { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> };
+    };
+    const createChatCallbackData = actionOptions.reply_markup?.inline_keyboard
+      ?.flat()
+      .find((button) => button.text === 'Создать новый чат')?.callback_data;
+    expect(createChatCallbackData).toBeDefined();
+    await handlers.handleCallback({ ...ctx, callbackData: createChatCallbackData });
 
     expect(deps.codex.startThread).toHaveBeenCalledWith({ cwd: 'C:\\Workspace\\New project' });
     expect(handlers.getSelectedThread(ownerId)).toBe('created-thread');
-    expect(replies.join('\n')).toContain('Created project chat');
+    expect(replies.join('\n')).toContain('Created new chat');
   });
 
-  it('creates another chat in the currently selected project', async () => {
+  it('creates a chat in the currently selected project', async () => {
     const replies: string[] = [];
     const replyOptions: unknown[] = [];
     const ctx: TelegramHandlerContext = {
@@ -98,8 +108,7 @@ describe('chat creation integration flow', () => {
     await handlers.handleNewChat(ctx);
 
     expect(deps.codex.startThread).toHaveBeenNthCalledWith(1, { cwd: 'C:\\Workspace\\New project' });
-    expect(deps.codex.startThread).toHaveBeenNthCalledWith(2, { cwd: 'C:\\Workspace\\New project' });
-    expect(handlers.getSelectedThread(ownerId)).toBe('created-thread');
+    expect(handlers.getSelectedThread(ownerId)).toBe('selected-thread');
     expect(replies.join('\n')).toContain('Created new chat');
   });
 });

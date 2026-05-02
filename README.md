@@ -54,7 +54,7 @@ Base menu before a project is selected:
 - `/help` - show available commands.
 - `/status` - show the Codex app-server WebSocket connection status and URL.
 - `/limits` - show current Codex limit remaining.
-- `/select_project` - choose a safe direct project directory under `<PROJECTS_ROOT>` and create a Codex chat in it.
+- `/select_project` - choose a safe direct project directory under `<PROJECTS_ROOT>`, then choose whether to create a new chat or select an existing project chat.
 - `/reboot` - restart Codex app-server and the bot through the supervisor.
 
 Project commands shown after a project is selected:
@@ -95,6 +95,7 @@ The WebSocket client also uses ping/pong heartbeat as a fallback for stale conne
 ## Manual Acceptance
 
 Latest manual Telegram acceptance for `/delete_chat` was confirmed by the owner on 2026-05-02.
+Manual Telegram acceptance for the two-button `/select_project` UX was confirmed by the owner on 2026-05-02.
 
 1. Start `npm run service`.
 2. In Telegram as user `<TELEGRAM_OWNER_ID>`, run `/status`.
@@ -103,9 +104,9 @@ Latest manual Telegram acceptance for `/delete_chat` was confirmed by the owner 
 5. Before selecting a project, run `/help` or type `/`; verify `/select_chat`, `/new_chat`, `/delete_chat`, `/current`, and `/summary_chat` are not shown.
 6. Manually run `/current`, `/summary_chat`, `/select_chat`, `/new_chat`, and `/delete_chat` before selecting a project; verify each rejects without starting a Codex turn and directs you to `/select_project` where appropriate.
 7. Run `/select_project`; verify only safe immediate directories under `<PROJECTS_ROOT>` are listed.
-8. Pick any listed safe direct child directory under `<PROJECTS_ROOT>`; verify the new chat is selected and project commands appear in `/help` or the Telegram command menu.
-9. Run `/select_chat`; verify only chats for the selected project are listed.
-10. Run `/new_chat`; verify a new chat is created in the same selected project, becomes selected, and project commands remain visible.
+8. Pick any listed safe direct child directory under `<PROJECTS_ROOT>`; verify Telegram shows `Создать новый чат` and `Выбрать чат`, without creating a chat yet, and project commands appear in `/help` or the Telegram command menu.
+9. Press `Выбрать чат`; verify only chats for the selected project are listed, or a clear no-chats message is shown.
+10. Press `Создать новый чат` or run `/new_chat`; verify a new chat is created in the same selected project, becomes selected, and project commands remain visible.
 11. Run `/delete_chat`; select a non-current chat, press `No`, and verify no chat is archived.
 12. Run `/delete_chat`; select a non-current chat, press `Yes, delete`, and verify it disappears from `/select_chat` while the current chat remains selected.
 13. Run `/delete_chat`; select the current chat, press `Yes, delete`, and verify a replacement chat is created in the same project and selected.
