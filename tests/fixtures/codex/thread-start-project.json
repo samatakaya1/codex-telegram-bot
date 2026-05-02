@@ -1,0 +1,21 @@
+{
+  "name": "thread-start-project",
+  "request": {
+    "id": 3,
+    "method": "thread/start",
+    "params": {
+      "cwd": "[safe project cwd]",
+      "sessionStartSource": "startup"
+    }
+  },
+  "response": {
+    "thread": {
+      "id": "[redacted]",
+      "cwd": "[redacted]",
+      "status": {
+        "type": "loaded"
+      }
+    }
+  },
+  "notifications": []
+}

@@ -1,0 +1,28 @@
+{
+  "name": "thread-list",
+  "request": {
+    "id": 2,
+    "method": "thread/list",
+    "params": {
+      "limit": 10,
+      "sortKey": "updated_at",
+      "sortDirection": "desc",
+      "archived": false,
+      "useStateDbOnly": true
+    }
+  },
+  "response": {
+    "data": [
+      {
+        "id": "[redacted]",
+        "preview": "[redacted]",
+        "cwd": "[redacted]",
+        "status": {
+          "type": "notLoaded"
+        },
+        "turns": []
+      }
+    ]
+  },
+  "notifications": []
+}

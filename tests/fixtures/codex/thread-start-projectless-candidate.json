@@ -1,0 +1,20 @@
+{
+  "name": "thread-start-projectless-candidate",
+  "request": {
+    "id": 5,
+    "method": "thread/start",
+    "params": {
+      "sessionStartSource": "startup"
+    }
+  },
+  "response": {
+    "thread": {
+      "id": "[redacted]",
+      "cwd": "[redacted]",
+      "status": {
+        "type": "loaded"
+      }
+    }
+  },
+  "notifications": []
+}

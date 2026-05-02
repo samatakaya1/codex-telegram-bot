@@ -1,0 +1,1048 @@
+import path from 'node:path';
+
+import type { AppConfig } from '../config/env.js';
+import type { AgentMessageDeltaNotification, CodexThread, JsonValue, TurnCompletedNotification } from '../codex/protocol.js';
+import { TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE } from '../domain/approvals.js';
+import { splitTelegramText } from '../domain/messages.js';
+import type { ProjectSummary } from '../domain/projects.js';
+import { formatRateLimits } from '../domain/rateLimits.js';
+import { ActiveTurnStore } from '../domain/turns.js';
+import {
+  readCodexSessionModelInfo,
+  readCodexSessionTokenUsage,
+  type CodexSessionModelInfo,
+  type CodexSessionTokenUsage
+} from '../storage/codexSession.js';
+import { checkTelegramAccess } from './access.js';
+import { CallbackDataStore } from './callbackData.js';
+import { helpTextForState } from './commands.js';
+
+export type TelegramHandlerContext = {
+  fromId?: number;
+  chatId?: number;
+  chatType?: string;
+  text?: string;
+  callbackData?: string;
+  reply: (text: string, options?: unknown) => Promise<void>;
+  answerCallbackQuery?: (text?: string) => Promise<void> | void;
+  confirmUpdate?: () => Promise<void> | void;
+};
+
+type InlineKeyboardOption = {
+  reply_markup: {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+};
+
+type ConnectionStatusChangedEvent = {
+  previousStatus: string;
+  status: string;
+  reason?: string;
+};
+
+export type TelegramHandlersDependencies = {
+  config: AppConfig;
+  codex: {
+    connectionStatus: string;
+    listThreads: () => Promise<CodexThread[]>;
+    resumeThread: (threadId: string) => Promise<CodexThread>;
+    startThread: (params: { cwd?: string }) => Promise<CodexThread>;
+    archiveThread?: (threadId: string) => Promise<void>;
+    startTurn: (params: { threadId: string; text: string }) => Promise<{ turnId: string }>;
+    readRateLimits?: () => Promise<JsonValue>;
+    getRateLimits?: () => JsonValue | null;
+    onAgentMessageDelta?: (listener: (event: AgentMessageDeltaNotification) => void) => () => void;
+    onTurnCompleted?: (listener: (event: TurnCompletedNotification) => void) => () => void;
+    onConnectionStatusChanged?: (listener: (event: ConnectionStatusChangedEvent) => void) => () => void;
+  };
+  readProjectlessThreadIds: (path: string) => Promise<Set<string>>;
+  listProjects: (root: string) => Promise<ProjectSummary[]>;
+  callbackData?: CallbackDataStore;
+  connectionLossGraceMs?: number;
+  deliveryRetryAttempts?: number;
+  deliveryRetryDelayMs?: number;
+  onDeliveryError?: (error: Error) => void;
+  onRebootRequested?: () => Promise<void> | void;
+  updateCommandMenu?: (chatId: number, hasSelectedChat: boolean) => Promise<void> | void;
+};
+
+export type TelegramHandlers = ReturnType<typeof createTelegramHandlers>;
+
+const MAX_LIST_ITEMS = 20;
+const MAX_LABEL_LENGTH = 80;
+const DEFAULT_CONNECTION_LOSS_GRACE_MS = 5000;
+const DEFAULT_DELIVERY_RETRY_ATTEMPTS = 2;
+const DEFAULT_DELIVERY_RETRY_DELAY_MS = 250;
+const CODEX_CONNECTION_LOST_MESSAGE =
+  'Codex app-server disconnected while processing this request. I will not resend it automatically. Check /status and retry if needed.';
+const SUMMARY_CHAT_PROMPT =
+  [
+    'Provide a concise status summary of this current chat for Telegram.',
+    'Answer in the language previously used in this chat; if there are no previous messages, default to English.',
+    'If this is a new chat with no prior context, say that there is no context because this is a new chat.',
+    'Include the current goal, completed work, current state, blockers if any, and recommended next steps.',
+    'Keep it brief and factual.'
+  ].join(' ');
+const SUMMARY_CHAT_WORKING_MESSAGE = 'Codex is preparing chat summary...';
+
+type SelectedChat = {
+  threadId: string;
+  title?: string;
+  modelInfo?: CodexSessionModelInfo;
+  modelInfoSource?: 'thread' | 'session';
+  modelInfoSessionMtimeMs?: number;
+  modelInfoSessionSize?: number;
+  tokenUsage?: CodexSessionTokenUsage;
+  tokenUsageSessionMtimeMs?: number;
+  tokenUsageSessionSize?: number;
+  sessionPath?: string;
+  projectPath?: string;
+};
+
+type PendingTurnContext = {
+  threadId: string;
+  telegramChatId: number;
+  selectedThreadId: string;
+  reply: (text: string, options?: unknown) => Promise<void>;
+  bufferedDeltas: AgentMessageDeltaNotification[];
+  bufferedCompletions: TurnCompletedNotification[];
+};
+
+export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
+  const callbackData = deps.callbackData ?? new CallbackDataStore();
+  const selectedChats = new Map<number, SelectedChat>();
+  const selectedProjects = new Map<number, string>();
+  const activeTurns = new ActiveTurnStore();
+  const pendingTurnThreadIds = new Set<string>();
+  const pendingTurnContexts = new Map<string, PendingTurnContext>();
+  const connectionLossTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  deps.codex.onAgentMessageDelta?.((event) => {
+    if (activeTurns.appendAgentDelta(event) !== null) {
+      return;
+    }
+
+    const pending = pendingTurnContexts.get(event.threadId);
+    if (pending !== undefined) {
+      pending.bufferedDeltas.push(event);
+    }
+  });
+
+  deps.codex.onTurnCompleted?.((event) => {
+    void handleTurnCompleted(event).catch((error: unknown) => reportDeliveryError(error));
+  });
+
+  deps.codex.onConnectionStatusChanged?.((event) => {
+    handleConnectionStatusChanged(event);
+  });
+
+  async function requireAccess(ctx: TelegramHandlerContext): Promise<boolean> {
+    const access = checkTelegramAccess({
+      ownerId: deps.config.telegramOwnerId,
+      fromId: ctx.fromId,
+      chatId: ctx.chatId,
+      chatType: ctx.chatType
+    });
+
+    if (!access.ok) {
+      await safeReply(ctx, access.message);
+      return false;
+    }
+
+    return true;
+  }
+
+  function ownerChatKey(ctx: TelegramHandlerContext): number {
+    return ctx.chatId ?? deps.config.telegramOwnerId;
+  }
+
+  function selectedProjectPath(chatId: number): string | undefined {
+    return selectedProjects.get(chatId) ?? selectedChats.get(chatId)?.projectPath;
+  }
+
+  function hasSelectedProject(ctx: TelegramHandlerContext): boolean {
+    return selectedProjectPath(ownerChatKey(ctx)) !== undefined;
+  }
+
+  function stateAwareHelpText(ctx: TelegramHandlerContext): string {
+    return helpTextForState(hasSelectedProject(ctx));
+  }
+
+  async function updateCommandMenu(chatId: number, hasChat: boolean): Promise<void> {
+    try {
+      await Promise.resolve(deps.updateCommandMenu?.(chatId, hasChat));
+    } catch (error) {
+      reportDeliveryError(error);
+    }
+  }
+
+  async function handleStart(ctx: TelegramHandlerContext): Promise<void> {
+    if (await requireAccess(ctx)) {
+      await safeReply(ctx, `Codex Telegram bridge ready.\n${stateAwareHelpText(ctx)}`);
+    }
+  }
+
+  async function handleHelp(ctx: TelegramHandlerContext): Promise<void> {
+    if (await requireAccess(ctx)) {
+      await safeReply(ctx, stateAwareHelpText(ctx));
+    }
+  }
+
+  async function handleStatus(ctx: TelegramHandlerContext): Promise<void> {
+    if (await requireAccess(ctx)) {
+      await safeReply(ctx, `Codex: ${deps.codex.connectionStatus}\nURL: ${deps.config.codexWsUrl}`);
+    }
+  }
+
+  async function handleLimits(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    try {
+      const snapshot = await deps.codex.readRateLimits?.();
+      if (snapshot !== undefined) {
+        await safeReply(ctx, formatRateLimits(snapshot));
+        return;
+      }
+    } catch {
+      const cached = deps.codex.getRateLimits?.() ?? null;
+      if (cached !== null) {
+        await safeReply(ctx, `${formatRateLimits(cached)}\nLast cached limit update; live read failed.`);
+        return;
+      }
+      await safeReply(ctx, 'Could not load Codex limits. Try again after Codex reconnects.');
+      return;
+    }
+
+    const cached = deps.codex.getRateLimits?.() ?? null;
+    await safeReply(ctx, cached === null ? 'No Codex limit data is available yet.' : formatRateLimits(cached));
+  }
+
+  async function handleProjectChats(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const projectPath = selectedProjectPath(ownerChatKey(ctx));
+    if (projectPath === undefined) {
+      await safeReply(ctx, 'No project selected. Use /select_project first, then /select_chat.');
+      return;
+    }
+
+    try {
+      const threads = await deps.codex.listThreads();
+      const selectedProject = normalizePathForIdentity(projectPath);
+      const projectThreads = threads.filter((thread) => {
+        const projectPath = projectPathFromThread(thread);
+        return projectPath !== undefined && normalizePathForIdentity(projectPath) === selectedProject;
+      });
+
+      if (projectThreads.length === 0) {
+        await safeReply(ctx, 'No chats for this project found. Use /new_chat to create one.');
+        return;
+      }
+
+      const rows = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread) => {
+        const title = displayTitleFromThread(thread) ?? 'Untitled chat';
+        return [{ text: title, callback_data: callbackData.createSelectChat(thread.id, projectPath) }];
+      });
+      const titles = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread, index) => {
+        return `${index + 1}. ${displayTitleFromThread(thread) ?? 'Untitled chat'}`;
+      });
+
+      await safeReply(ctx, `Project chats:\n${titles.join('\n')}`, keyboard(rows));
+    } catch {
+      await safeReply(ctx, 'Could not load project chats. Check Codex app-server and try again.');
+    }
+  }
+
+  async function handleSelectProject(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    try {
+      const projects = await deps.listProjects(deps.config.projectsRoot);
+      if (projects.length === 0) {
+        await safeReply(ctx, 'No safe projects found.');
+        return;
+      }
+
+      const visible = projects.slice(0, MAX_LIST_ITEMS);
+      const rows = visible.map((project) => [
+        { text: truncateLabel(project.name), callback_data: callbackData.createProjectChat(project.path) }
+      ]);
+      const names = visible.map((project, index) => `${index + 1}. ${truncateLabel(project.name)}`);
+      await safeReply(ctx, `Projects:\n${names.join('\n')}`, keyboard(rows));
+    } catch {
+      await safeReply(ctx, 'Could not load projects. Check the configured projects root and try again.');
+    }
+  }
+
+  async function handleNewChat(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const projectPath = selectedProjectPath(ownerChatKey(ctx));
+    if (projectPath === undefined) {
+      await safeReply(ctx, 'No project selected. Use /select_project first.');
+      return;
+    }
+
+    try {
+      const thread = await deps.codex.startThread({ cwd: projectPath });
+      const chatId = ownerChatKey(ctx);
+      setSelectedChat(chatId, thread, projectPath);
+      const refreshed = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
+      await updateCommandMenu(chatId, refreshed.projectPath !== undefined);
+      await safeReply(ctx, `Created new chat.\n${formatCurrentChat(refreshed)}`);
+    } catch {
+      await safeReply(ctx, 'Could not create a new chat for the selected project.');
+    }
+  }
+
+  async function handleDeleteChat(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const chatId = ownerChatKey(ctx);
+    const projectPath = selectedProjectPath(chatId);
+    if (projectPath === undefined) {
+      await safeReply(ctx, 'No project selected. Use /select_project first.');
+      return;
+    }
+
+    try {
+      const projectThreads = await listProjectThreads(projectPath);
+
+      if (projectThreads.length === 0) {
+        await safeReply(ctx, 'No chats for this project found. Use /new_chat to create one.');
+        return;
+      }
+
+      const rows = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread) => {
+        const title = displayTitleFromThread(thread) ?? 'Untitled chat';
+        return [{ text: title, callback_data: callbackData.createDeleteChat(thread.id, projectPath) }];
+      });
+      const titles = projectThreads.slice(0, MAX_LIST_ITEMS).map((thread, index) => {
+        return `${index + 1}. ${displayTitleFromThread(thread) ?? 'Untitled chat'}`;
+      });
+
+      await safeReply(ctx, `Project chats to delete:\n${titles.join('\n')}`, keyboard(rows));
+    } catch {
+      await safeReply(ctx, 'Could not load project chats. Check Codex app-server and try again.');
+    }
+  }
+
+  async function listProjectThreads(projectPath: string): Promise<CodexThread[]> {
+    const threads = await deps.codex.listThreads();
+    const selectedProject = normalizePathForIdentity(projectPath);
+    return threads.filter((thread) => {
+      const threadProjectPath = projectPathFromThread(thread);
+      return threadProjectPath !== undefined && normalizePathForIdentity(threadProjectPath) === selectedProject;
+    });
+  }
+
+  function callbackMatchesSelectedProject(chatId: number, callbackProjectPath: string): boolean {
+    const projectPath = selectedProjectPath(chatId);
+    return projectPath !== undefined && normalizePathForIdentity(projectPath) === normalizePathForIdentity(callbackProjectPath);
+  }
+
+  async function handleCurrent(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const selected = selectedChats.get(ownerChatKey(ctx));
+    if (selected === undefined) {
+      await safeReply(ctx, 'No chat selected. Use /select_project first.');
+      return;
+    }
+
+    const refreshed = await refreshSelectedChat(ownerChatKey(ctx), selected);
+    await safeReply(ctx, formatCurrentChat(refreshed));
+  }
+
+  async function handleSummaryChat(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const selected = selectedChats.get(ownerChatKey(ctx));
+    if (selected === undefined) {
+      await safeReply(ctx, 'No chat selected. Use /select_project first.');
+      return;
+    }
+
+    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before requesting /summary_chat.');
+      return;
+    }
+
+    await startCodexTurn(ctx, selected, SUMMARY_CHAT_PROMPT, SUMMARY_CHAT_WORKING_MESSAGE);
+  }
+
+  async function handleCallback(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    if (ctx.callbackData?.startsWith('a:') === true) {
+      await answerCallback(ctx, 'Approval unavailable');
+      await safeReply(ctx, TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE);
+      return;
+    }
+
+    const selectedThreadId = callbackData.resolveSelectChat(ctx.callbackData);
+    if (selectedThreadId !== null) {
+      await handleSelectChatCallback(ctx, selectedThreadId);
+      return;
+    }
+
+    const deleteChat = callbackData.resolveDeleteChat(ctx.callbackData);
+    if (deleteChat !== null) {
+      await handleDeleteChatCallback(ctx, deleteChat.threadId, deleteChat.projectPath);
+      return;
+    }
+
+    const deleteConfirm = callbackData.resolveDeleteChatConfirm(ctx.callbackData);
+    if (deleteConfirm !== null) {
+      await handleDeleteChatConfirmCallback(ctx, deleteConfirm);
+      return;
+    }
+
+    const projectPath = callbackData.resolveProjectChat(ctx.callbackData);
+    if (projectPath !== null) {
+      await handleProjectChatCallback(ctx, projectPath);
+      return;
+    }
+
+    await safeReply(ctx, 'This button expired. Run the command again.');
+  }
+
+  async function handleText(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const text = ctx.text?.trim() ?? '';
+    if (text === '?' || text === '/') {
+      await safeReply(ctx, stateAwareHelpText(ctx));
+      return;
+    }
+
+    if (text.startsWith('/')) {
+      await safeReply(ctx, 'Unknown command. Use /help to see available commands.');
+      return;
+    }
+
+    const selected = selectedChats.get(ownerChatKey(ctx));
+    if (selected === undefined) {
+      await safeReply(ctx, 'No chat selected. Use /select_project first, then /select_chat.');
+      return;
+    }
+
+    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish.');
+      return;
+    }
+
+    await startCodexTurn(ctx, selected, text);
+  }
+
+  async function handleReboot(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    await safeReply(ctx, 'Restarting Codex app-server and Telegram bot...');
+    try {
+      await Promise.resolve(ctx.confirmUpdate?.());
+    } catch (error) {
+      reportDeliveryError(error);
+      await safeReply(ctx, 'Could not confirm reboot request with Telegram. Restart cancelled; try /reboot again.');
+      return;
+    }
+    await deps.onRebootRequested?.();
+  }
+
+  function setSelectedChat(chatId: number, thread: CodexThread, projectPath?: string): void {
+    const modelInfo = modelInfoFromThread(thread);
+    storeSelectedChat(chatId, {
+      threadId: thread.id,
+      title: displayTitleFromThread(thread),
+      modelInfo,
+      modelInfoSource: modelInfo === undefined ? undefined : 'thread',
+      sessionPath: sessionPathFromThread(thread),
+      projectPath: projectPath ?? projectPathFromThread(thread)
+    });
+  }
+
+  function storeSelectedChat(chatId: number, selected: SelectedChat): void {
+    selectedChats.set(chatId, selected);
+    if (selected.projectPath !== undefined) {
+      selectedProjects.set(chatId, selected.projectPath);
+    }
+  }
+
+  function clearSelectedChatThread(chatId: number, projectPath?: string): void {
+    selectedChats.delete(chatId);
+    if (projectPath !== undefined) {
+      selectedProjects.set(chatId, projectPath);
+    }
+  }
+
+  async function refreshSelectedChat(chatId: number, selected: SelectedChat): Promise<SelectedChat> {
+    try {
+      const threads = await deps.codex.listThreads();
+      const thread = threads.find((candidate) => candidate.id === selected.threadId);
+      if (thread === undefined) {
+        return refreshSelectedModelInfo(chatId, selected);
+      }
+
+      const sessionPath = sessionPathFromThread(thread) ?? selected.sessionPath;
+      const sessionPathChanged = sessionPath !== selected.sessionPath;
+      const useCachedSessionModel = selected.modelInfoSource === 'session' && !sessionPathChanged;
+      const threadModelInfo = useCachedSessionModel ? undefined : modelInfoFromThread(thread);
+      const refreshed: SelectedChat = {
+        threadId: selected.threadId,
+        title: displayTitleFromThread(thread) ?? selected.title,
+        modelInfo: threadModelInfo ?? (sessionPathChanged ? undefined : selected.modelInfo),
+        modelInfoSource: threadModelInfo === undefined ? (sessionPathChanged ? undefined : selected.modelInfoSource) : 'thread',
+        modelInfoSessionMtimeMs: sessionPathChanged ? undefined : selected.modelInfoSessionMtimeMs,
+        modelInfoSessionSize: sessionPathChanged ? undefined : selected.modelInfoSessionSize,
+        tokenUsage: sessionPathChanged ? undefined : selected.tokenUsage,
+        tokenUsageSessionMtimeMs: sessionPathChanged ? undefined : selected.tokenUsageSessionMtimeMs,
+        tokenUsageSessionSize: sessionPathChanged ? undefined : selected.tokenUsageSessionSize,
+        sessionPath,
+        projectPath: selected.projectPath ?? projectPathFromThread(thread)
+      };
+      return refreshSelectedModelInfo(chatId, refreshed);
+    } catch {
+      return refreshSelectedModelInfo(chatId, selected);
+    }
+  }
+
+  async function refreshSelectedModelInfo(chatId: number, selected: SelectedChat): Promise<SelectedChat> {
+    if (selected.sessionPath === undefined) {
+      storeSelectedChat(chatId, selected);
+      return selected;
+    }
+
+    try {
+      const snapshot = await readCodexSessionModelInfo(selected.sessionPath, {
+        knownMtimeMs: selected.modelInfoSessionMtimeMs,
+        knownSize: selected.modelInfoSessionSize
+      });
+      const refreshed = snapshot.unchanged
+        ? selected
+        : {
+          ...selected,
+          modelInfo: snapshot.modelInfo ?? selected.modelInfo,
+          modelInfoSource: snapshot.modelInfo === null ? selected.modelInfoSource : 'session',
+          modelInfoSessionMtimeMs: snapshot.mtimeMs,
+          modelInfoSessionSize: snapshot.size
+        };
+      return refreshSelectedTokenUsage(chatId, refreshed);
+    } catch {
+      return refreshSelectedTokenUsage(chatId, selected);
+    }
+  }
+
+  async function refreshSelectedTokenUsage(chatId: number, selected: SelectedChat): Promise<SelectedChat> {
+    if (selected.sessionPath === undefined) {
+      storeSelectedChat(chatId, selected);
+      return selected;
+    }
+
+    try {
+      const snapshot = await readCodexSessionTokenUsage(selected.sessionPath, {
+        knownMtimeMs: selected.tokenUsageSessionMtimeMs,
+        knownSize: selected.tokenUsageSessionSize
+      });
+      const refreshed = snapshot.unchanged
+        ? selected
+        : {
+          ...selected,
+          tokenUsage: snapshot.tokenUsage ?? undefined,
+          tokenUsageSessionMtimeMs: snapshot.mtimeMs,
+          tokenUsageSessionSize: snapshot.size
+        };
+      storeSelectedChat(chatId, refreshed);
+      return refreshed;
+    } catch {
+      storeSelectedChat(chatId, selected);
+      return selected;
+    }
+  }
+
+  async function handleSelectChatCallback(ctx: TelegramHandlerContext, threadId: string): Promise<void> {
+    try {
+      const thread = await deps.codex.resumeThread(threadId);
+      const projectPath = callbackData.resolveSelectChatProjectPath(ctx.callbackData) ?? projectPathFromThread(thread);
+      const chatId = ownerChatKey(ctx);
+      setSelectedChat(chatId, thread, projectPath);
+      const selected = await refreshSelectedChat(chatId, selectedChats.get(chatId)!);
+      await updateCommandMenu(chatId, selected.projectPath !== undefined);
+      await answerCallback(ctx, 'Selected');
+      await safeReply(ctx, formatCurrentChat(selected));
+    } catch {
+      await safeReply(ctx, 'Could not select chat. Try /select_chat again.');
+    }
+  }
+
+  async function handleDeleteChatCallback(
+    ctx: TelegramHandlerContext,
+    threadId: string,
+    callbackProjectPath: string
+  ): Promise<void> {
+    const chatId = ownerChatKey(ctx);
+    if (!callbackMatchesSelectedProject(chatId, callbackProjectPath)) {
+      await safeReply(ctx, 'This delete button no longer matches the selected project. Run /delete_chat again.');
+      return;
+    }
+
+    try {
+      const projectThreads = await listProjectThreads(callbackProjectPath);
+      const thread = projectThreads.find((candidate) => candidate.id === threadId);
+      if (thread === undefined) {
+        await safeReply(ctx, 'This chat is no longer available. Run /delete_chat again.');
+        return;
+      }
+
+      const title = displayTitleFromThread(thread) ?? 'Untitled chat';
+      await answerCallback(ctx, 'Confirm delete');
+      await safeReply(ctx, `Delete chat?\n${title}`, keyboard([
+        [
+          {
+            text: 'Yes, delete',
+            callback_data: callbackData.createDeleteChatConfirm(threadId, callbackProjectPath, true)
+          }
+        ],
+        [
+          {
+            text: 'No',
+            callback_data: callbackData.createDeleteChatConfirm(threadId, callbackProjectPath, false)
+          }
+        ]
+      ]));
+    } catch {
+      await safeReply(ctx, 'Could not load chat details. Run /delete_chat again.');
+    }
+  }
+
+  async function handleDeleteChatConfirmCallback(
+    ctx: TelegramHandlerContext,
+    deleteConfirm: { threadId: string; projectPath: string; confirmed: boolean }
+  ): Promise<void> {
+    const chatId = ownerChatKey(ctx);
+    if (!callbackMatchesSelectedProject(chatId, deleteConfirm.projectPath)) {
+      await safeReply(ctx, 'This delete button no longer matches the selected project. Run /delete_chat again.');
+      return;
+    }
+
+    if (!deleteConfirm.confirmed) {
+      await answerCallback(ctx, 'Cancelled');
+      await safeReply(ctx, 'Delete cancelled.');
+      return;
+    }
+
+    if (pendingTurnThreadIds.has(deleteConfirm.threadId) || activeTurns.isThreadBusy(deleteConfirm.threadId)) {
+      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before deleting it.');
+      return;
+    }
+
+    if (deps.codex.archiveThread === undefined) {
+      await safeReply(ctx, 'Could not delete chat. Check Codex app-server and try again.');
+      return;
+    }
+
+    const selected = selectedChats.get(chatId);
+    const deletingSelectedChat = selected?.threadId === deleteConfirm.threadId;
+
+    try {
+      await deps.codex.archiveThread(deleteConfirm.threadId);
+    } catch {
+      await safeReply(ctx, 'Could not delete chat. Check Codex app-server and try again.');
+      return;
+    }
+
+    if (!deletingSelectedChat) {
+      await answerCallback(ctx, 'Deleted');
+      await safeReply(ctx, 'Deleted chat.');
+      return;
+    }
+
+    try {
+      const replacement = await deps.codex.startThread({ cwd: deleteConfirm.projectPath });
+      setSelectedChat(chatId, replacement, deleteConfirm.projectPath);
+      const refreshed = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
+      await updateCommandMenu(chatId, refreshed.projectPath !== undefined);
+      await answerCallback(ctx, 'Deleted');
+      await safeReply(ctx, `Deleted selected chat.\n${formatCurrentChat(refreshed)}`);
+    } catch {
+      clearSelectedChatThread(chatId, deleteConfirm.projectPath);
+      await updateCommandMenu(chatId, true);
+      await answerCallback(ctx, 'Deleted');
+      await safeReply(ctx, 'Deleted selected chat, but could not create a replacement. Use /new_chat or /select_chat.');
+    }
+  }
+
+  async function handleProjectChatCallback(ctx: TelegramHandlerContext, requestedProjectPath: string): Promise<void> {
+    try {
+      const projects = await deps.listProjects(deps.config.projectsRoot);
+      const safeProject = projects.find((project) => {
+        return normalizePathForIdentity(project.path) === normalizePathForIdentity(requestedProjectPath);
+      });
+
+      if (safeProject === undefined) {
+        await safeReply(ctx, 'This project is no longer available. Run /select_project again.');
+        return;
+      }
+
+      const thread = await deps.codex.startThread({ cwd: safeProject.path });
+      const chatId = ownerChatKey(ctx);
+      setSelectedChat(chatId, thread, safeProject.path);
+      const selected = await refreshSelectedModelInfo(chatId, selectedChats.get(chatId)!);
+      await updateCommandMenu(chatId, selected.projectPath !== undefined);
+      await answerCallback(ctx, 'Created');
+      await safeReply(ctx, `Created project chat.\n${formatCurrentChat(selected)}`);
+    } catch {
+      await safeReply(ctx, 'Could not create project chat. Check Codex app-server and try again.');
+    }
+  }
+
+  async function startCodexTurn(
+    ctx: TelegramHandlerContext,
+    selected: SelectedChat,
+    text: string,
+    workingMessage = 'Codex is working...'
+  ): Promise<void> {
+    const chatId = ownerChatKey(ctx);
+    const pending: PendingTurnContext = {
+      threadId: selected.threadId,
+      telegramChatId: chatId,
+      selectedThreadId: selected.threadId,
+      reply: ctx.reply,
+      bufferedDeltas: [],
+      bufferedCompletions: []
+    };
+
+    pendingTurnThreadIds.add(selected.threadId);
+    pendingTurnContexts.set(selected.threadId, pending);
+
+    try {
+      const started = await deps.codex.startTurn({ threadId: selected.threadId, text });
+      if (pendingTurnContexts.get(selected.threadId) !== pending) {
+        return;
+      }
+
+      pendingTurnContexts.delete(selected.threadId);
+      pendingTurnThreadIds.delete(selected.threadId);
+      activeTurns.start({
+        threadId: selected.threadId,
+        turnId: started.turnId,
+        telegramChatId: chatId,
+        selectedThreadId: selected.threadId,
+        reply: ctx.reply
+      });
+
+      await safeReply(ctx, workingMessage);
+      for (const delta of pending.bufferedDeltas) {
+        activeTurns.appendAgentDelta(delta);
+      }
+      for (const completion of pending.bufferedCompletions) {
+        await handleTurnCompleted(completion);
+      }
+    } catch {
+      if (pendingTurnContexts.get(selected.threadId) === pending) {
+        if (connectionLossTimers.has(selected.threadId)) {
+          return;
+        }
+        pendingTurnContexts.delete(selected.threadId);
+        pendingTurnThreadIds.delete(selected.threadId);
+        await safeReply(ctx, 'Could not start Codex turn. Check /status and try again.');
+      }
+    }
+  }
+
+  async function handleTurnCompleted(event: TurnCompletedNotification): Promise<void> {
+    const turnId = event.turn.id;
+    const active = activeTurns.getByTurnId(turnId);
+    if (active === undefined || active.threadId !== event.threadId) {
+      const pending = pendingTurnContexts.get(event.threadId);
+      if (pending !== undefined) {
+        pending.bufferedCompletions.push(event);
+      }
+      return;
+    }
+
+    clearConnectionLossTimer(event.threadId);
+    const completed = event.turn.status === 'completed' ? activeTurns.complete({ threadId: event.threadId, turnId }) : activeTurns.fail({ threadId: event.threadId, turnId });
+    if (completed === null) {
+      return;
+    }
+
+    if (event.turn.status === 'completed') {
+      for (const chunk of splitTelegramText(completed.accumulatedAssistantText)) {
+        await replyWithRetries(completed.reply ?? (() => Promise.resolve()), chunk);
+      }
+      return;
+    }
+
+    await replyWithRetries(completed.reply ?? (() => Promise.resolve()), 'Codex turn failed. Check Codex Desktop or CLI for details.');
+  }
+
+  function handleConnectionStatusChanged(event: ConnectionStatusChangedEvent): void {
+    if (event.status !== 'reconnecting' && event.status !== 'disconnected') {
+      return;
+    }
+
+    const affectedThreadIds = new Set<string>();
+    for (const turn of activeTurns.listActive()) {
+      affectedThreadIds.add(turn.threadId);
+    }
+    for (const threadId of pendingTurnThreadIds) {
+      affectedThreadIds.add(threadId);
+    }
+
+    for (const threadId of affectedThreadIds) {
+      if (!connectionLossTimers.has(threadId)) {
+        connectionLossTimers.set(
+          threadId,
+          setTimeout(() => {
+            void failThreadForConnectionLoss(threadId).catch((error: unknown) => reportDeliveryError(error));
+          }, deps.connectionLossGraceMs ?? DEFAULT_CONNECTION_LOSS_GRACE_MS)
+        );
+      }
+    }
+  }
+
+  async function failThreadForConnectionLoss(threadId: string): Promise<void> {
+    connectionLossTimers.delete(threadId);
+    const pending = pendingTurnContexts.get(threadId);
+    if (pending !== undefined) {
+      pendingTurnContexts.delete(threadId);
+      pendingTurnThreadIds.delete(threadId);
+      await replyWithRetries(pending.reply, CODEX_CONNECTION_LOST_MESSAGE);
+      return;
+    }
+
+    const active = activeTurns.markThreadIdle(threadId);
+    if (active !== null) {
+      await replyWithRetries(active.reply ?? (() => Promise.resolve()), CODEX_CONNECTION_LOST_MESSAGE);
+    }
+  }
+
+  function clearConnectionLossTimer(threadId: string): void {
+    const timer = connectionLossTimers.get(threadId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      connectionLossTimers.delete(threadId);
+    }
+  }
+
+  async function answerCallback(ctx: TelegramHandlerContext, text?: string): Promise<void> {
+    try {
+      await ctx.answerCallbackQuery?.(text);
+    } catch (error) {
+      reportDeliveryError(error);
+    }
+  }
+  async function safeReply(ctx: TelegramHandlerContext, text: string, options?: unknown): Promise<void> {
+    try {
+      await ctx.reply(text, options);
+    } catch (error) {
+      reportDeliveryError(error);
+    }
+  }
+
+  async function replyWithRetries(reply: (text: string, options?: unknown) => Promise<void>, text: string): Promise<void> {
+    const attempts = deps.deliveryRetryAttempts ?? DEFAULT_DELIVERY_RETRY_ATTEMPTS;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        await reply(text);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 < attempts) {
+          await sleep(deps.deliveryRetryDelayMs ?? DEFAULT_DELIVERY_RETRY_DELAY_MS);
+        }
+      }
+    }
+
+    reportDeliveryError(lastError);
+  }
+
+  function reportDeliveryError(error: unknown): void {
+    deps.onDeliveryError?.(error instanceof Error ? error : new Error(String(error)));
+  }
+
+  return {
+    callbackData,
+    handleStart,
+    handleHelp,
+    handleStatus,
+    handleLimits,
+    handleProjectChats,
+    handleSelectProject,
+    handleNewChat,
+    handleDeleteChat,
+    handleCurrent,
+    handleSummaryChat,
+    handleCallback,
+    handleText,
+    handleReboot,
+    getSelectedThread(chatId: number): string | null {
+      return selectedChats.get(chatId)?.threadId ?? null;
+    },
+    setSelectedThread(chatId: number, threadId: string, projectPath?: string): void {
+      selectedChats.set(chatId, { threadId, projectPath });
+      if (projectPath === undefined) {
+        selectedProjects.delete(chatId);
+      } else {
+        selectedProjects.set(chatId, projectPath);
+      }
+    }
+  };
+}
+
+
+function keyboard(rows: InlineKeyboardOption['reply_markup']['inline_keyboard']): InlineKeyboardOption {
+  return { reply_markup: { inline_keyboard: rows } };
+}
+
+function nameFromThread(thread: CodexThread): string | undefined {
+  if (typeof thread.name === 'string' && thread.name.trim().length > 0) {
+    return thread.name.trim();
+  }
+  return undefined;
+}
+
+function previewFromThread(thread: CodexThread): string | undefined {
+  if (typeof thread.preview === 'string' && thread.preview.trim().length > 0) {
+    return thread.preview.trim();
+  }
+  return undefined;
+}
+
+function stringFromUnknown(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function modelInfoFromThread(thread: CodexThread): CodexSessionModelInfo | undefined {
+  const model = stringFromUnknown(thread.model);
+  if (model === undefined) {
+    return undefined;
+  }
+
+  const effort = stringFromUnknown(thread.effort) ?? stringFromUnknown(thread.reasoning_effort);
+  return effort === undefined ? { model } : { model, effort };
+}
+
+function sessionPathFromThread(thread: CodexThread): string | undefined {
+  const sessionPath = stringFromUnknown(thread.path);
+  return sessionPath !== undefined && path.extname(sessionPath).toLowerCase() === '.jsonl' ? sessionPath : undefined;
+}
+
+function displayTitleFromThread(thread: CodexThread): string | undefined {
+  const name = nameFromThread(thread);
+  if (name !== undefined) {
+    const title = displayTitleCandidate(name);
+    if (title !== undefined) {
+      return title;
+    }
+  }
+
+  const preview = previewFromThread(thread);
+  if (preview !== undefined) {
+    return displayTitleCandidate(firstLine(preview));
+  }
+
+  return undefined;
+}
+
+function projectPathFromThread(thread: CodexThread): string | undefined {
+  return typeof thread.cwd === 'string' && thread.cwd.trim().length > 0 ? thread.cwd : undefined;
+}
+
+function formatCurrentChat(selectedChat: SelectedChat): string {
+  const lines = [`Selected chat: ${selectedChat.title ?? 'Untitled chat'}`];
+  const modelLine = formatModelInfo(selectedChat.modelInfo);
+  if (modelLine !== undefined) {
+    lines.push(modelLine);
+  }
+  lines.push(formatContextUsage(selectedChat.tokenUsage));
+  lines.push(`Project: ${selectedChat.projectPath ?? 'Unknown project'}`);
+  return lines.join('\n');
+}
+
+function truncateLabel(value: string): string {
+  return value.length <= MAX_LABEL_LENGTH ? value : `${value.slice(0, MAX_LABEL_LENGTH - 3)}...`;
+}
+
+function singleLine(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function firstLine(value: string): string {
+  return singleLine(value.split(/\r?\n/, 1)[0] ?? value);
+}
+
+function displayTitleCandidate(value: string): string | undefined {
+  const candidate = singleLine(value);
+  if (candidate.length === 0 || isRolloutSessionFileName(candidate)) {
+    return undefined;
+  }
+
+  return truncateLabel(candidate);
+}
+
+function isRolloutSessionFileName(value: string): boolean {
+  return /^rollout-\d{4}-\d{2}-\d{2}t.+\.jsonl$/i.test(path.basename(value));
+}
+
+function formatModelInfo(modelInfo: CodexSessionModelInfo | undefined): string | undefined {
+  if (modelInfo === undefined) {
+    return undefined;
+  }
+
+  const model = singleLine(modelInfo.model);
+  const effort = modelInfo.effort === undefined ? undefined : singleLine(modelInfo.effort);
+  return `Model: ${truncateLabel(effort === undefined ? model : `${model} ${effort}`)}`;
+}
+
+function formatContextUsage(tokenUsage: CodexSessionTokenUsage | undefined): string {
+  if (tokenUsage === undefined) {
+    return 'Context: not available yet';
+  }
+
+  const used = formatTokenCount(tokenUsage.usedTokens);
+  const window = formatTokenCount(tokenUsage.contextWindowTokens);
+  const percent = Math.round((tokenUsage.usedTokens / tokenUsage.contextWindowTokens) * 100);
+  return `Context: ${used} / ${window} (${percent}%)`;
+}
+
+function formatTokenCount(tokens: number): string {
+  if (tokens < 1000) {
+    return String(tokens);
+  }
+
+  return `${Math.round(tokens / 1000)}k`;
+}
+
+function normalizePathForIdentity(value: string): string {
+  const normalized = path.win32.normalize(value);
+  const root = path.win32.parse(normalized).root;
+  const withoutTrailingSeparators = normalized.length > root.length ? normalized.replace(/[\\/]+$/, '') : normalized;
+  return withoutTrailingSeparators.toLowerCase();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

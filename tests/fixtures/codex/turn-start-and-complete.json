@@ -1,0 +1,57 @@
+{
+  "name": "turn-start-and-complete",
+  "request": {
+    "id": 6,
+    "method": "turn/start",
+    "params": {
+      "threadId": "[redacted]",
+      "input": [
+        {
+          "type": "text",
+          "text": "[redacted]",
+          "text_elements": []
+        }
+      ]
+    }
+  },
+  "response": {
+    "turn": {
+      "id": "[redacted]",
+      "status": "running"
+    }
+  },
+  "notifications": [
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "[redacted]",
+        "turnId": "[redacted]",
+        "item": {
+          "id": "[redacted]",
+          "type": "agentMessage",
+          "phase": "final_answer"
+        }
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "[redacted]",
+        "turnId": "[redacted]",
+        "itemId": "[redacted]",
+        "delta": "[redacted]"
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "[redacted]",
+        "turn": {
+          "id": "[redacted]",
+          "status": "completed",
+          "error": null
+        }
+      }
+    }
+  ]
+}

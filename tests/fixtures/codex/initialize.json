@@ -1,0 +1,25 @@
+{
+  "name": "initialize",
+  "request": {
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "clientInfo": {
+        "name": "[redacted]",
+        "title": "Codex Telegram Protocol Spike",
+        "version": "0.1.0"
+      },
+      "capabilities": {
+        "experimentalApi": true,
+        "optOutNotificationMethods": []
+      }
+    }
+  },
+  "response": {
+    "userAgent": "[redacted]",
+    "codexHome": "[redacted]",
+    "platformFamily": "windows",
+    "platformOs": "windows"
+  },
+  "notifications": []
+}

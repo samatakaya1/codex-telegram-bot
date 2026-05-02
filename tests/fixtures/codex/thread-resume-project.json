@@ -1,0 +1,21 @@
+{
+  "name": "thread-resume-project",
+  "request": {
+    "id": 4,
+    "method": "thread/resume",
+    "params": {
+      "threadId": "[redacted]",
+      "excludeTurns": true
+    }
+  },
+  "response": {
+    "thread": {
+      "id": "[redacted]",
+      "cwd": "[redacted]",
+      "status": {
+        "type": "loaded"
+      }
+    }
+  },
+  "notifications": []
+}

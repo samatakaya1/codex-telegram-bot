@@ -1,0 +1,19 @@
+{
+  "name": "thread-archive",
+  "request": {
+    "id": 8,
+    "method": "thread/archive",
+    "params": {
+      "threadId": "[redacted]"
+    }
+  },
+  "response": {},
+  "notifications": [
+    {
+      "method": "thread/archived",
+      "params": {
+        "threadId": "[redacted]"
+      }
+    }
+  ]
+}
