@@ -6,7 +6,14 @@ import type { ServerRequest } from './codex/protocol.js';
 import { CODEX_APPROVAL_REJECTION_MESSAGE, TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE } from './domain/approvals.js';
 import { telegramCommandsForState, type TelegramCommandDefinition } from './telegram/commands.js';
 import { createTelegramBot, sanitizeTelegramError } from './telegram/bot.js';
+import { STARTUP_NOTIFICATION_MESSAGE, startupNotificationOptions } from './telegram/startup.js';
 import { createLogger } from './utils/logger.js';
+
+type StartupNotificationOptions = ReturnType<typeof startupNotificationOptions>;
+
+type RuntimeStartOptions = {
+  onStart?: () => Promise<void> | void;
+};
 
 type RuntimeBot = {
   api: {
@@ -14,8 +21,9 @@ type RuntimeBot = {
       commands: readonly TelegramCommandDefinition[],
       other?: { readonly scope?: { readonly type: 'chat'; readonly chat_id: number } }
     ) => Promise<unknown> | unknown;
+    sendMessage: (chatId: number, text: string, options?: StartupNotificationOptions) => Promise<unknown> | unknown;
   };
-  start: () => Promise<void> | void;
+  start: (options?: RuntimeStartOptions) => Promise<void> | void;
   stop: () => Promise<void> | void;
 };
 
@@ -137,8 +145,27 @@ export async function startRuntime(deps: StartRuntimeDependencies): Promise<Star
     return 'shutdown-requested';
   }
 
-  await deps.bot.start();
+  await deps.bot.start({
+    onStart: () => scheduleStartupNotification(deps.bot, deps.logger, deps.telegramOwnerId)
+  });
   return 'started';
+}
+
+function scheduleStartupNotification(bot: RuntimeBot, logger: RuntimeLogger, telegramOwnerId: number): void {
+  const notification = setImmediate(() => {
+    void sendStartupNotification(bot, logger, telegramOwnerId);
+  });
+  notification.unref?.();
+}
+
+async function sendStartupNotification(bot: RuntimeBot, logger: RuntimeLogger, telegramOwnerId: number): Promise<void> {
+  try {
+    await Promise.resolve(
+      bot.api.sendMessage(telegramOwnerId, STARTUP_NOTIFICATION_MESSAGE, startupNotificationOptions())
+    );
+  } catch (error) {
+    logger.warn({ telegramError: sanitizeTelegramError(error) }, 'Telegram startup notification failed');
+  }
 }
 
 async function configureTelegramCommandMenu(bot: RuntimeBot, logger: RuntimeLogger, telegramOwnerId: number): Promise<void> {

@@ -66,7 +66,10 @@ describe('runtime shutdown', () => {
   it('does not start Telegram polling after shutdown is requested during startup', async () => {
     let releaseConnect: () => void = () => undefined;
     const bot = {
-      api: { setMyCommands: vi.fn(async () => undefined) },
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(async () => undefined)
+      },
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined)
     };
@@ -101,7 +104,8 @@ describe('runtime shutdown', () => {
       api: {
         setMyCommands: vi.fn(async () => {
           calls.push('commands');
-        })
+        }),
+        sendMessage: vi.fn(async () => undefined)
       },
       start: vi.fn(async () => {
         calls.push('start');
@@ -132,6 +136,101 @@ describe('runtime shutdown', () => {
     expect(calls).toEqual(['commands', 'commands', 'start']);
   });
 
+  it('sends the owner a startup notification with a select-project button when polling starts', async () => {
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(async () => undefined)
+      },
+      start: vi.fn(async (options?: { onStart?: () => Promise<void> | void }) => {
+        await Promise.resolve(options?.onStart?.());
+      }),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    await expect(startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: 42 })).resolves.toBe('started');
+
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalledTimes(1));
+    expect(bot.api.sendMessage).toHaveBeenCalledWith(42, 'Codex Telegram bridge started.', {
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Выбрать проект', callback_data: 'select_project' }]]
+      }
+    });
+  });
+
+  it('does not wait for startup notification delivery before completing the start hook', async () => {
+    let releaseSendMessage: () => void = () => undefined;
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              releaseSendMessage = resolve;
+            })
+        )
+      },
+      start: vi.fn(async (options?: { onStart?: () => Promise<void> | void }) => {
+        await Promise.resolve(options?.onStart?.());
+      }),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    const startup = startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: 42 });
+
+    await expect(Promise.race([startup, sleep(20).then(() => 'blocked')])).resolves.toBe('started');
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalledTimes(1));
+    releaseSendMessage();
+  });
+
+  it('logs sanitized startup notification failures without failing startup', async () => {
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(async () => {
+          throw Object.assign(new Error('telegram failed'), {
+            payload: { text: 'raw startup notice text' },
+            description: 'raw telegram failure'
+          });
+        })
+      },
+      start: vi.fn(async (options?: { onStart?: () => Promise<void> | void }) => {
+        await Promise.resolve(options?.onStart?.());
+      }),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    await expect(startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: 42 })).resolves.toBe('started');
+
+    await vi.waitFor(() =>
+      expect(logger.warn).toHaveBeenCalledWith(
+        { telegramError: expect.objectContaining({ hasPayload: true, hasDescription: true }) },
+        'Telegram startup notification failed'
+      )
+    );
+    const logged = JSON.stringify(logger.warn.mock.calls);
+    expect(logged).not.toContain('raw startup notice text');
+    expect(logged).not.toContain('raw telegram failure');
+  });
+
   it('continues startup when Telegram command menu registration fails', async () => {
     const bot = {
       api: {
@@ -140,7 +239,8 @@ describe('runtime shutdown', () => {
             payload: { token: 'secret' },
             description: 'raw telegram failure'
           });
-        })
+        }),
+        sendMessage: vi.fn(async () => undefined)
       },
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined)
@@ -169,7 +269,8 @@ describe('runtime shutdown', () => {
         setMyCommands: vi
           .fn()
           .mockRejectedValueOnce(Object.assign(new Error('telegram failed'), { description: 'raw failure' }))
-          .mockResolvedValueOnce(undefined)
+          .mockResolvedValueOnce(undefined),
+        sendMessage: vi.fn(async () => undefined)
       },
       start: vi.fn(async () => undefined),
       stop: vi.fn(async () => undefined)
@@ -202,6 +303,10 @@ describe('runtime shutdown', () => {
     );
   });
 });
+
+function sleep(ms: number): Promise<string> {
+  return new Promise((resolve) => setTimeout(() => resolve('blocked'), ms));
+}
 
 describe('approval fallback notification', () => {
   it('notifies the Telegram owner with a sanitized fail-closed message', async () => {

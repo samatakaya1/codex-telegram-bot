@@ -16,6 +16,7 @@ import {
 import { checkTelegramAccess } from './access.js';
 import { CallbackDataStore } from './callbackData.js';
 import { helpTextForState } from './commands.js';
+import { SELECT_PROJECT_STARTUP_CALLBACK_DATA } from './startup.js';
 
 export type TelegramHandlerContext = {
   fromId?: number;
@@ -402,6 +403,12 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     if (ctx.callbackData?.startsWith('a:') === true) {
       await answerCallback(ctx, 'Approval unavailable');
       await safeReply(ctx, TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE);
+      return;
+    }
+
+    if (ctx.callbackData === SELECT_PROJECT_STARTUP_CALLBACK_DATA) {
+      await answerCallback(ctx, 'Select project');
+      await handleSelectProject(ctx);
       return;
     }
 

@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AppConfig } from '../../src/config/env.js';
 import type { CodexThread, JsonValue } from '../../src/codex/protocol.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from '../../src/telegram/handlers.js';
+import { SELECT_PROJECT_STARTUP_CALLBACK_DATA } from '../../src/telegram/startup.js';
 
 const ownerId = 42;
 
@@ -455,6 +456,49 @@ describe('telegram handlers', () => {
     expect(replies.join('\n')).toContain('New project');
     expect(JSON.stringify(replyOptions)).toContain('pc:');
     expect(deps.listProjects).toHaveBeenCalledWith('C:\\Workspace');
+  });
+
+  it('opens the project picker from the startup select-project button', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    const { ctx, replies, replyOptions } = makeContext({ callbackData: SELECT_PROJECT_STARTUP_CALLBACK_DATA });
+
+    await handlers.handleCallback(ctx);
+
+    expect(replies.join('\n')).toContain('Projects:');
+    expect(replies.join('\n')).toContain('New project');
+    expect(JSON.stringify(replyOptions)).toContain('pc:');
+    expect(deps.listProjects).toHaveBeenCalledWith('C:\\Workspace');
+  });
+
+  it('rejects startup select-project callbacks from non-owners before listing projects', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    const { ctx, replies } = makeContext({
+      fromId: 1,
+      chatId: 1,
+      callbackData: SELECT_PROJECT_STARTUP_CALLBACK_DATA
+    });
+
+    await handlers.handleCallback(ctx);
+
+    expect(replies.join('\n')).toContain('Access denied');
+    expect(deps.listProjects).not.toHaveBeenCalled();
+  });
+
+  it('rejects startup select-project callbacks from groups before listing projects', async () => {
+    const deps = dependencies();
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    const { ctx, replies } = makeContext({
+      chatId: -100,
+      chatType: 'group',
+      callbackData: SELECT_PROJECT_STARTUP_CALLBACK_DATA
+    });
+
+    await handlers.handleCallback(ctx);
+
+    expect(replies.join('\n')).toContain('private chat');
+    expect(deps.listProjects).not.toHaveBeenCalled();
   });
 
   it('truncates long chat and project labels before sending list messages', async () => {

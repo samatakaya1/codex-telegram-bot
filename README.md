@@ -46,7 +46,7 @@ Only Telegram user id `<TELEGRAM_OWNER_ID>` is accepted. The MVP rejects group a
 
 ## Commands
 
-The Telegram command menu is dynamic. On startup the bot registers base commands globally and resets the owner private-chat scope to base commands. After the owner selects a project, the owner chat menu is updated with project commands. Hidden commands can still be typed manually; handlers keep validating state and fail closed. Non-owner chats may see Telegram's global base menu, but access checks reject them before any Codex call.
+The Telegram command menu is dynamic. On startup the bot registers base commands globally and resets the owner private-chat scope to base commands. When Telegram polling starts, the owner private chat receives a startup notification with a `Выбрать проект` button that opens the same project picker as `/select_project`. After the owner selects a project, the owner chat menu is updated with project commands. Hidden commands can still be typed manually; handlers keep validating state and fail closed. Non-owner chats may see Telegram's global base menu, but access checks reject them before any Codex call.
 
 Base menu before a project is selected:
 
@@ -96,8 +96,9 @@ The WebSocket client also uses ping/pong heartbeat as a fallback for stale conne
 
 Latest manual Telegram acceptance for `/delete_chat` was confirmed by the owner on 2026-05-02.
 Manual Telegram acceptance for the two-button `/select_project` UX was confirmed by the owner on 2026-05-02.
+Manual Telegram acceptance for the startup notification and `Выбрать проект` button was confirmed by the owner on 2026-05-03.
 
-1. Start `npm run service`.
+1. Start `npm run service`; verify the owner private chat receives `Codex Telegram bridge started.` with a `Выбрать проект` button.
 2. In Telegram as user `<TELEGRAM_OWNER_ID>`, run `/status`.
 3. Run `/reboot`; verify both Codex app-server and the bot restart.
 4. Run `/limits`; verify current Codex limit remaining is shown or a clear retryable error is returned.
