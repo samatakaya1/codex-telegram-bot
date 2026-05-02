@@ -3,6 +3,7 @@ dist/
 logs/
 .tmp/
 tmp/
+prompt-configs/
 
 # Local environment
 .env

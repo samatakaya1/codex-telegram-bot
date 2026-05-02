@@ -3,8 +3,10 @@ import { Bot, type Context, InlineKeyboard } from 'grammy';
 import type { AppConfig } from '../config/env.js';
 import type { CodexAppServerClient } from '../codex/appServerClient.js';
 import { listProjects } from '../domain/projects.js';
+import { DEFAULT_PROMPT_CONFIGS } from '../promptConfigs/defaults.js';
 import { requestProcessReboot } from '../runtime/reboot.js';
 import { readProjectlessThreadIds } from '../storage/codexGlobalState.js';
+import { createFilePromptConfigStore, type PromptConfigStore } from '../storage/promptConfigs.js';
 import { telegramCommandsForState } from './commands.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from './handlers.js';
 
@@ -15,6 +17,7 @@ type CreateTelegramBotOptions = {
     error: (payload: unknown, message?: string) => void;
     warn?: (payload: unknown, message?: string) => void;
   };
+  promptConfigs?: PromptConfigStore;
   onRebootRequested?: () => Promise<void> | void;
 };
 
@@ -53,6 +56,13 @@ export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
     codex: options.codex,
     readProjectlessThreadIds,
     listProjects,
+    promptConfigs:
+      options.promptConfigs ??
+      createFilePromptConfigStore({
+        dir: options.config.promptConfigDir,
+        defaults: DEFAULT_PROMPT_CONFIGS,
+        logger: options.logger
+      }),
     onRebootRequested: options.onRebootRequested ?? requestProcessReboot,
     onDeliveryError: (error) => options.logger?.error({ telegramError: sanitizeTelegramError(error) }, 'Telegram delivery failed'),
     updateCommandMenu: async (chatId, hasSelectedChat) => {
@@ -70,6 +80,7 @@ export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
   bot.command('delete_chat', (ctx) => handlers.handleDeleteChat(toHandlerContext(ctx)));
   bot.command('current', (ctx) => handlers.handleCurrent(toHandlerContext(ctx)));
   bot.command('summary_chat', (ctx) => handlers.handleSummaryChat(toHandlerContext(ctx)));
+  bot.command('review_fix', (ctx) => handlers.handleReviewFix(toHandlerContext(ctx)));
   bot.command('reboot', (ctx) => handlers.handleReboot(toHandlerContext(ctx)));
   bot.on('callback_query:data', (ctx) => handlers.handleCallback(toHandlerContext(ctx)));
   bot.on('message:text', (ctx) => handlers.handleText(toHandlerContext(ctx)));

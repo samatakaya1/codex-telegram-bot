@@ -17,7 +17,8 @@ export const ACTIVE_CHAT_TELEGRAM_COMMANDS = [
   { command: 'new_chat', description: 'Create another chat in the selected project' },
   { command: 'delete_chat', description: 'Delete a chat from the selected project' },
   { command: 'current', description: 'Show selected chat, context, and project' },
-  { command: 'summary_chat', description: 'Ask Codex for selected chat summary' }
+  { command: 'summary_chat', description: 'Ask Codex for selected chat summary' },
+  { command: 'review_fix', description: 'Review and fix issues in the selected chat' }
 ] as const satisfies readonly TelegramCommandDefinition[];
 
 export const TELEGRAM_COMMANDS = [...BASE_TELEGRAM_COMMANDS, ...ACTIVE_CHAT_TELEGRAM_COMMANDS] as const;

@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { AppConfig } from '../../src/config/env.js';
 import type { CodexThread, JsonValue } from '../../src/codex/protocol.js';
+import type { PromptConfig } from '../../src/domain/promptConfigs.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from '../../src/telegram/handlers.js';
 import { SELECT_PROJECT_STARTUP_CALLBACK_DATA } from '../../src/telegram/startup.js';
 
@@ -18,6 +19,7 @@ function config(): AppConfig {
     codexWsUrl: 'ws://127.0.0.1:18765',
     codexGlobalStatePath: 'C:\\CodexState\\.codex-global-state.json',
     projectsRoot: 'C:\\Workspace',
+    promptConfigDir: 'prompt-configs',
     logLevel: 'info',
     botRunMode: 'DEV'
   };
@@ -77,6 +79,22 @@ function dependencies() {
   };
 }
 
+function reviewFixPromptConfig(overrides: Partial<PromptConfig> = {}): PromptConfig {
+  return {
+    schemaVersion: 1,
+    id: 'review_fix',
+    title: 'Review Fix',
+    description: 'Review current project or chat work.',
+    triggers: ['/review_fix'],
+    telegramMenuCommand: 'review_fix',
+    requiresSelectedChat: true,
+    workingMessage: 'Starting configured review/fix cycle...',
+    prompt: 'Configured review/fix prompt',
+    enabled: true,
+    ...overrides
+  };
+}
+
 describe('telegram handlers', () => {
   it('implements start, help, status, limits, select_project, new_chat, and current commands', async () => {
     const deps = dependencies();
@@ -97,6 +115,7 @@ describe('telegram handlers', () => {
     expect(help.replies.join('\n')).not.toContain('/delete_chat');
     expect(help.replies.join('\n')).not.toContain('/current');
     expect(help.replies.join('\n')).not.toContain('/summary_chat');
+    expect(help.replies.join('\n')).not.toContain('/review_fix');
     expect(help.replies.join('\n')).not.toContain('/projects');
     expect(help.replies.join('\n')).not.toContain('/new_project_chat');
 
@@ -129,6 +148,7 @@ describe('telegram handlers', () => {
     expect(selectedHelp.replies.join('\n')).toContain('/delete_chat');
     expect(selectedHelp.replies.join('\n')).toContain('/current');
     expect(selectedHelp.replies.join('\n')).toContain('/summary_chat');
+    expect(selectedHelp.replies.join('\n')).toContain('/review_fix');
 
     const selectProject = makeContext();
     await handlers.handleSelectProject(selectProject.ctx);
@@ -973,6 +993,41 @@ describe('telegram handlers', () => {
     expect(summary.replies.join('\n')).toContain('Codex is preparing chat summary');
   });
 
+  it('starts a Codex turn from the review_fix prompt config', async () => {
+    const deps = dependencies();
+    const promptConfigs = {
+      getPromptConfig: vi.fn(async () => reviewFixPromptConfig())
+    };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'thread-for-review', 'C:\\Workspace\\Project');
+
+    const review = makeContext();
+    await handlers.handleReviewFix(review.ctx);
+
+    expect(promptConfigs.getPromptConfig).toHaveBeenCalledWith('review_fix');
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({
+      threadId: 'thread-for-review',
+      text: 'Configured review/fix prompt'
+    });
+    expect(review.replies.join('\n')).toContain('Starting configured review/fix cycle');
+  });
+
+  it('treats /review-fix as an unknown slash command', async () => {
+    const deps = dependencies();
+    const promptConfigs = {
+      getPromptConfig: vi.fn(async () => reviewFixPromptConfig())
+    };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'thread-for-review-hyphen', 'C:\\Workspace\\Project');
+
+    const review = makeContext({ text: '/review-fix' });
+    await handlers.handleText(review.ctx);
+
+    expect(promptConfigs.getPromptConfig).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(review.replies.join('\n')).toContain('Unknown command');
+  });
+
   it('rejects summary_chat before a project chat is selected', async () => {
     const deps = dependencies();
     const handlers = createTelegramHandlers({ config: config(), ...deps });
@@ -983,6 +1038,19 @@ describe('telegram handlers', () => {
     expect(deps.codex.startTurn).not.toHaveBeenCalled();
     expect(deps.updateCommandMenu).not.toHaveBeenCalled();
     expect(summary.replies.join('\n')).toContain('No chat selected');
+  });
+
+  it('rejects review_fix before a project chat is selected', async () => {
+    const deps = dependencies();
+    const promptConfigs = { getPromptConfig: vi.fn() };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    const review = makeContext();
+
+    await handlers.handleReviewFix(review.ctx);
+
+    expect(promptConfigs.getPromptConfig).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(review.replies.join('\n')).toContain('No chat selected');
   });
 
   it('directs users to create or select a chat after a project is selected', async () => {
@@ -1011,6 +1079,27 @@ describe('telegram handlers', () => {
     expect(deps.updateCommandMenu).not.toHaveBeenCalled();
   });
 
+  it('directs review_fix users to create or select a chat after a project is selected', async () => {
+    const deps = dependencies();
+    const promptConfigs = { getPromptConfig: vi.fn() };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    await handlers.handleCallback(makeContext({
+      callbackData: handlers.callbackData.createSelectProject('C:\\Workspace\\Project')
+    }).ctx);
+    deps.updateCommandMenu.mockClear();
+
+    const review = makeContext();
+    await handlers.handleReviewFix(review.ctx);
+
+    const response = review.replies.join('\n');
+    expect(response).toContain('No chat selected');
+    expect(response).toContain('/new_chat');
+    expect(response).toContain('/select_chat');
+    expect(response).not.toContain('Use /select_project first');
+    expect(promptConfigs.getPromptConfig).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
   it('keeps active-chat commands hidden when the selected thread has no project', async () => {
     const deps = dependencies();
     const handlers = createTelegramHandlers({ config: config(), ...deps });
@@ -1025,6 +1114,7 @@ describe('telegram handlers', () => {
     expect(help.replies.join('\n')).not.toContain('/delete_chat');
     expect(help.replies.join('\n')).not.toContain('/current');
     expect(help.replies.join('\n')).not.toContain('/summary_chat');
+    expect(help.replies.join('\n')).not.toContain('/review_fix');
   });
 
   it('shows context as not available yet when token count is missing', async () => {
@@ -1055,6 +1145,92 @@ describe('telegram handlers', () => {
     expect(deps.codex.startTurn).toHaveBeenCalledTimes(1);
     expect(summary.replies.join('\n')).toContain('already running');
     expect(summary.replies.join('\n')).toContain('/summary_chat');
+  });
+
+  it('rejects review_fix while the selected thread is busy', async () => {
+    const deps = dependencies();
+    const promptConfigs = { getPromptConfig: vi.fn() };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'busy-thread', 'C:\\Workspace\\Project');
+    await handlers.handleText(makeContext({ text: 'first turn' }).ctx);
+
+    const review = makeContext();
+    await handlers.handleReviewFix(review.ctx);
+
+    expect(promptConfigs.getPromptConfig).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).toHaveBeenCalledTimes(1);
+    expect(review.replies.join('\n')).toContain('already running');
+    expect(review.replies.join('\n')).toContain('/review_fix');
+  });
+
+  it('rejects review_fix while the prompt config is still loading for the selected thread', async () => {
+    const deps = dependencies();
+    const resolvers: Array<(value: PromptConfig) => void> = [];
+    const promptConfigs = {
+      getPromptConfig: vi.fn(
+        () =>
+          new Promise<PromptConfig>((resolve) => {
+            resolvers.push(resolve);
+          })
+      )
+    };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'pending-config-thread', 'C:\\Workspace\\Project');
+
+    const first = makeContext();
+    const firstPromise = handlers.handleReviewFix(first.ctx);
+    await vi.waitFor(() => expect(promptConfigs.getPromptConfig).toHaveBeenCalledTimes(1));
+
+    const second = makeContext();
+    const secondPromise = handlers.handleReviewFix(second.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const promptConfigCallCount = promptConfigs.getPromptConfig.mock.calls.length;
+    for (const resolve of resolvers) {
+      resolve(reviewFixPromptConfig());
+    }
+    await Promise.allSettled([firstPromise, secondPromise]);
+
+    expect(promptConfigCallCount).toBe(1);
+    expect(second.replies.join('\n')).toContain('already running');
+    expect(deps.codex.startTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects review_fix when the prompt config is missing or disabled', async () => {
+    const deps = dependencies();
+    const promptConfigs = { getPromptConfig: vi.fn(async () => null as PromptConfig | null) };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'missing-config-thread', 'C:\\Workspace\\Project');
+
+    const missing = makeContext();
+    await handlers.handleReviewFix(missing.ctx);
+
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(missing.replies.join('\n')).toContain('unavailable');
+
+    promptConfigs.getPromptConfig.mockResolvedValueOnce(reviewFixPromptConfig({ enabled: false }));
+    const disabled = makeContext();
+    await handlers.handleReviewFix(disabled.ctx);
+
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(disabled.replies.join('\n')).toContain('unavailable');
+  });
+
+  it('rejects review_fix when the prompt config store fails', async () => {
+    const deps = dependencies();
+    const promptConfigs = {
+      getPromptConfig: vi.fn(async (): Promise<PromptConfig | null> => {
+        throw new Error('prompt config store failed');
+      })
+    };
+    const handlers = createTelegramHandlers({ config: config(), ...deps, promptConfigs });
+    handlers.setSelectedThread(ownerId, 'failing-config-thread', 'C:\\Workspace\\Project');
+
+    const review = makeContext();
+    await handlers.handleReviewFix(review.ctx);
+
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(review.replies.join('\n')).toContain('Could not load');
   });
 
   it('rejects summary_chat while a summary turn is still starting', async () => {
@@ -1659,6 +1835,7 @@ describe('telegram handlers', () => {
     expect(response).not.toContain('/delete_chat');
     expect(response).not.toContain('/current');
     expect(response).not.toContain('/summary_chat');
+    expect(response).not.toContain('/review_fix');
     expect(deps.codex.startTurn).not.toHaveBeenCalled();
   });
 
@@ -1678,6 +1855,7 @@ describe('telegram handlers', () => {
     expect(question.replies.join('\n')).toContain('/delete_chat');
     expect(question.replies.join('\n')).toContain('/current');
     expect(question.replies.join('\n')).toContain('/summary_chat');
+    expect(question.replies.join('\n')).toContain('/review_fix');
     expect(slash.replies.join('\n')).not.toContain('/chats');
     expect(slash.replies.join('\n')).not.toContain('/new_project_chat');
     expect(deps.codex.startTurn).not.toHaveBeenCalled();

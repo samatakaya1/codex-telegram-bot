@@ -14,6 +14,7 @@ function config(): AppConfig {
     codexWsUrl: 'ws://127.0.0.1:18765',
     codexGlobalStatePath: 'C:\\CodexState\\.codex-global-state.json',
     projectsRoot: 'C:\\Workspace',
+    promptConfigDir: 'prompt-configs',
     logLevel: 'info',
     botRunMode: 'DEV'
   };

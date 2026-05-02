@@ -36,6 +36,7 @@ TELEGRAM_OWNER_ID=<TELEGRAM_OWNER_ID>
 CODEX_WS_URL=ws://127.0.0.1:18765
 CODEX_GLOBAL_STATE_PATH=<CODEX_GLOBAL_STATE_PATH>
 PROJECTS_ROOT=<PROJECTS_ROOT>
+PROMPT_CONFIG_DIR=prompt-configs
 LOG_LEVEL=info
 BOT_RUN_MODE=DEV
 ```
@@ -64,6 +65,7 @@ Project commands shown after a project is selected:
 - `/delete_chat` - delete a chat from the selected project by archiving it in Codex.
 - `/current` - show the selected chat, model/context, and project.
 - `/summary_chat` - ask Codex to summarize the selected chat.
+- `/review_fix` - ask Codex to review current project or chat work, fix valid issues, and verify.
 
 Always supported:
 
@@ -72,6 +74,14 @@ Always supported:
 
 Telegram clients may cache command menus briefly; command handlers are the source of truth.
 
+## Prompt Configs
+
+Prompt-backed commands load editable prompt configs from `PROMPT_CONFIG_DIR`. The default value is `prompt-configs`, which is local-only and ignored by git.
+
+The bot creates missing built-in default prompt files on first use. Users can edit `prompt-configs/review_fix.json` or add additional prompt configs without changing tracked source files.
+
+`/review_fix` depends on the context available to Codex in the selected thread. The Telegram bridge does not directly read full chat history or git diffs through `codex app-server`; the prompt asks Codex to inspect available project changes or visible chat artifacts and to report clearly when more context is needed.
+
 ## Safety Notes
 
 - Projectless Desktop chats are not exposed in Telegram.
@@ -79,6 +89,7 @@ Telegram clients may cache command menus briefly; command handlers are the sourc
 - Project creation only accepts direct, readable, non-hidden, non-system, non-reparse directories under `<PROJECTS_ROOT>`.
 - `/delete_chat` archives a Codex thread with `thread/archive`; it does not physically delete session/history files.
 - Approval requests fail closed. Telegram approve/reject buttons are intentionally disabled until exact app-server approval protocol shapes are captured.
+- `/review_fix` may edit project files only when Codex can identify reviewable project changes and the local environment permits the required tools. If approval is required, the existing fail-closed approval behavior applies.
 - If `codex app-server` disconnects during an active turn, the bot sends a failure notice after a short grace period and does not resend the prompt automatically.
 - The supervisor sends owner-only Telegram notices when the `codex app-server` or bot child process exits unexpectedly.
 - Logs redact bot tokens, authorization headers, raw Telegram updates, raw Codex protocol events, and raw approval payloads by default.
@@ -102,8 +113,8 @@ Manual Telegram acceptance for the startup notification and `Выбрать пр
 2. In Telegram as user `<TELEGRAM_OWNER_ID>`, run `/status`.
 3. Run `/reboot`; verify both Codex app-server and the bot restart.
 4. Run `/limits`; verify current Codex limit remaining is shown or a clear retryable error is returned.
-5. Before selecting a project, run `/help` or type `/`; verify `/select_chat`, `/new_chat`, `/delete_chat`, `/current`, and `/summary_chat` are not shown.
-6. Manually run `/current`, `/summary_chat`, `/select_chat`, `/new_chat`, and `/delete_chat` before selecting a project; verify each rejects without starting a Codex turn and directs you to `/select_project` where appropriate.
+5. Before selecting a project, run `/help` or type `/`; verify `/select_chat`, `/new_chat`, `/delete_chat`, `/current`, `/summary_chat`, and `/review_fix` are not shown.
+6. Manually run `/current`, `/summary_chat`, `/review_fix`, `/select_chat`, `/new_chat`, and `/delete_chat` before selecting a project; verify each rejects without starting a Codex turn and directs you to `/select_project` where appropriate.
 7. Run `/select_project`; verify only safe immediate directories under `<PROJECTS_ROOT>` are listed.
 8. Pick any listed safe direct child directory under `<PROJECTS_ROOT>`; verify Telegram shows `Создать новый чат` and `Выбрать чат`, without creating a chat yet, and project commands appear in `/help` or the Telegram command menu.
 9. Press `Выбрать чат`; verify only chats for the selected project are listed, or a clear no-chats message is shown.
@@ -113,15 +124,16 @@ Manual Telegram acceptance for the startup notification and `Выбрать пр
 13. Run `/delete_chat`; select the current chat, press `Yes, delete`, and verify a replacement chat is created in the same project and selected.
 14. Run `/current`; verify context usage is shown, or a clear not-available fallback.
 15. Run `/summary_chat`; verify Codex starts a summary turn in the selected chat, or rejects the request while the chat is busy.
-16. Send `ping`; verify the Codex response returns to Telegram.
-17. Send a second message while Codex is answering; verify it is rejected.
-18. Try a non-owner user and a group chat; verify no Codex call happens.
-19. Ask for a long answer; verify Telegram replies are split into ordered chunks.
-20. Run `/reboot`; after restart, verify the command menu returns to the base no-project commands until a project is selected again.
-21. During an active turn, simulate a WebSocket connection loss while the bot remains alive; verify no duplicate prompt is sent, Telegram receives a clear failure notice, and `/status` reports reconnecting or disconnected.
-22. Separately kill the supervisor-managed app-server; verify the supervisor sends an owner notice and stops the bot.
-23. Trigger an approval-requiring Codex action if available; verify it fails closed and the owner gets a Telegram notice to continue in Codex Desktop or CLI.
-24. Inspect logs; verify bot tokens, authorization headers, raw Telegram updates, raw Codex events, approval payloads, outgoing Telegram delivery payloads, and command-menu update failures are not printed with raw payload text.
+16. Run `/review_fix`; verify Codex starts a review/fix turn in the selected chat, creates `prompt-configs/review_fix.json` if missing, or rejects the request while the chat is busy.
+17. Send `ping`; verify the Codex response returns to Telegram.
+18. Send a second message while Codex is answering; verify it is rejected.
+19. Try a non-owner user and a group chat; verify no Codex call happens.
+20. Ask for a long answer; verify Telegram replies are split into ordered chunks.
+21. Run `/reboot`; after restart, verify the command menu returns to the base no-project commands until a project is selected again.
+22. During an active turn, simulate a WebSocket connection loss while the bot remains alive; verify no duplicate prompt is sent, Telegram receives a clear failure notice, and `/status` reports reconnecting or disconnected.
+23. Separately kill the supervisor-managed app-server; verify the supervisor sends an owner notice and stops the bot.
+24. Trigger an approval-requiring Codex action if available; verify it fails closed and the owner gets a Telegram notice to continue in Codex Desktop or CLI.
+25. Inspect logs; verify bot tokens, authorization headers, raw Telegram updates, raw Codex events, approval payloads, outgoing Telegram delivery payloads, and command-menu update failures are not printed with raw payload text.
 
 ## Verification
 

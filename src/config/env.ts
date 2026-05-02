@@ -14,6 +14,7 @@ const envSchema = z.object({
     .refine((value) => value.startsWith('ws://') || value.startsWith('wss://'), 'CODEX_WS_URL must start with ws:// or wss://'),
   CODEX_GLOBAL_STATE_PATH: z.string().trim().min(1, 'CODEX_GLOBAL_STATE_PATH is required'),
   PROJECTS_ROOT: z.string().trim().min(1, 'PROJECTS_ROOT is required'),
+  PROMPT_CONFIG_DIR: z.string().trim().min(1, 'PROMPT_CONFIG_DIR must not be empty').default('prompt-configs'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
   BOT_RUN_MODE: z.enum(['DEV', 'PROD']).default('DEV')
 });
@@ -24,6 +25,7 @@ export type AppConfig = {
   codexWsUrl: string;
   codexGlobalStatePath: string;
   projectsRoot: string;
+  promptConfigDir: string;
   logLevel: string;
   botRunMode: 'DEV' | 'PROD';
 };
@@ -47,6 +49,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): AppConfig {
     codexWsUrl: parsed.data.CODEX_WS_URL,
     codexGlobalStatePath: parsed.data.CODEX_GLOBAL_STATE_PATH,
     projectsRoot: parsed.data.PROJECTS_ROOT,
+    promptConfigDir: parsed.data.PROMPT_CONFIG_DIR,
     logLevel: parsed.data.LOG_LEVEL,
     botRunMode: parsed.data.BOT_RUN_MODE
   };

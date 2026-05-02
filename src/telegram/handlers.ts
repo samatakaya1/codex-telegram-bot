@@ -4,15 +4,18 @@ import type { AppConfig } from '../config/env.js';
 import type { AgentMessageDeltaNotification, CodexThread, JsonValue, TurnCompletedNotification } from '../codex/protocol.js';
 import { TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE } from '../domain/approvals.js';
 import { splitTelegramText } from '../domain/messages.js';
+import type { PromptConfig } from '../domain/promptConfigs.js';
 import type { ProjectSummary } from '../domain/projects.js';
 import { formatRateLimits } from '../domain/rateLimits.js';
 import { ActiveTurnStore } from '../domain/turns.js';
+import { DEFAULT_PROMPT_CONFIGS } from '../promptConfigs/defaults.js';
 import {
   readCodexSessionModelInfo,
   readCodexSessionTokenUsage,
   type CodexSessionModelInfo,
   type CodexSessionTokenUsage
 } from '../storage/codexSession.js';
+import type { PromptConfigStore } from '../storage/promptConfigs.js';
 import { checkTelegramAccess } from './access.js';
 import { CallbackDataStore } from './callbackData.js';
 import { helpTextForState } from './commands.js';
@@ -59,6 +62,7 @@ export type TelegramHandlersDependencies = {
   readProjectlessThreadIds: (path: string) => Promise<Set<string>>;
   listProjects: (root: string) => Promise<ProjectSummary[]>;
   callbackData?: CallbackDataStore;
+  promptConfigs?: PromptConfigStore;
   connectionLossGraceMs?: number;
   deliveryRetryAttempts?: number;
   deliveryRetryDelayMs?: number;
@@ -85,6 +89,7 @@ const SUMMARY_CHAT_PROMPT =
     'Keep it brief and factual.'
   ].join(' ');
 const SUMMARY_CHAT_WORKING_MESSAGE = 'Codex is preparing chat summary...';
+const REVIEW_FIX_CONFIG_ID = 'review_fix';
 const CREATE_PROJECT_CHAT_BUTTON = 'Создать новый чат';
 const SELECT_PROJECT_CHAT_BUTTON = 'Выбрать чат';
 const PROJECT_UNAVAILABLE_MESSAGE = 'This project is no longer available. Run /select_project again.';
@@ -114,6 +119,13 @@ type PendingTurnContext = {
 
 export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
   const callbackData = deps.callbackData ?? new CallbackDataStore();
+  const promptConfigs =
+    deps.promptConfigs ??
+    ({
+      async getPromptConfig(id: string) {
+        return DEFAULT_PROMPT_CONFIGS.find((config) => config.id === id) ?? null;
+      }
+    } satisfies PromptConfigStore);
   const selectedChats = new Map<number, SelectedChat>();
   const selectedProjects = new Map<number, string>();
   const activeTurns = new ActiveTurnStore();
@@ -393,6 +405,49 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     await startCodexTurn(ctx, selected, SUMMARY_CHAT_PROMPT, SUMMARY_CHAT_WORKING_MESSAGE);
+  }
+
+  async function handleReviewFix(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    const chatId = ownerChatKey(ctx);
+    const selected = selectedChats.get(chatId);
+    if (selected === undefined) {
+      await safeReply(ctx, noChatSelectedMessage(chatId));
+      return;
+    }
+
+    if (selectedProjectPath(chatId) === undefined) {
+      await safeReply(ctx, 'No project selected. Use /select_project first.');
+      return;
+    }
+
+    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before requesting /review_fix.');
+      return;
+    }
+
+    const pending = reservePendingTurn(ctx, selected);
+    let config: PromptConfig | null;
+    try {
+      config = await promptConfigs.getPromptConfig(REVIEW_FIX_CONFIG_ID);
+    } catch {
+      if (releasePendingTurn(selected.threadId, pending)) {
+        await safeReply(ctx, 'Could not load /review_fix prompt config. Check prompt-configs/review_fix.json and try again.');
+      }
+      return;
+    }
+
+    if (config === null || !config.enabled) {
+      if (releasePendingTurn(selected.threadId, pending)) {
+        await safeReply(ctx, '/review_fix prompt config is unavailable. Check prompt-configs/review_fix.json and try again.');
+      }
+      return;
+    }
+
+    await startReservedCodexTurn(ctx, selected, pending, config.prompt, config.workingMessage);
   }
 
   async function handleCallback(ctx: TelegramHandlerContext): Promise<void> {
@@ -851,6 +906,11 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     text: string,
     workingMessage = 'Codex is working...'
   ): Promise<void> {
+    const pending = reservePendingTurn(ctx, selected);
+    await startReservedCodexTurn(ctx, selected, pending, text, workingMessage);
+  }
+
+  function reservePendingTurn(ctx: TelegramHandlerContext, selected: SelectedChat): PendingTurnContext {
     const chatId = ownerChatKey(ctx);
     const pending: PendingTurnContext = {
       threadId: selected.threadId,
@@ -863,7 +923,26 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
     pendingTurnThreadIds.add(selected.threadId);
     pendingTurnContexts.set(selected.threadId, pending);
+    return pending;
+  }
 
+  function releasePendingTurn(threadId: string, pending: PendingTurnContext): boolean {
+    if (pendingTurnContexts.get(threadId) !== pending) {
+      return false;
+    }
+
+    pendingTurnContexts.delete(threadId);
+    pendingTurnThreadIds.delete(threadId);
+    return true;
+  }
+
+  async function startReservedCodexTurn(
+    ctx: TelegramHandlerContext,
+    selected: SelectedChat,
+    pending: PendingTurnContext,
+    text: string,
+    workingMessage: string
+  ): Promise<void> {
     try {
       const started = await deps.codex.startTurn({ threadId: selected.threadId, text });
       if (pendingTurnContexts.get(selected.threadId) !== pending) {
@@ -875,7 +954,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       activeTurns.start({
         threadId: selected.threadId,
         turnId: started.turnId,
-        telegramChatId: chatId,
+        telegramChatId: pending.telegramChatId,
         selectedThreadId: selected.threadId,
         reply: ctx.reply
       });
@@ -892,9 +971,9 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
         if (connectionLossTimers.has(selected.threadId)) {
           return;
         }
-        pendingTurnContexts.delete(selected.threadId);
-        pendingTurnThreadIds.delete(selected.threadId);
-        await safeReply(ctx, 'Could not start Codex turn. Check /status and try again.');
+        if (releasePendingTurn(selected.threadId, pending)) {
+          await safeReply(ctx, 'Could not start Codex turn. Check /status and try again.');
+        }
       }
     }
   }
@@ -1025,6 +1104,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     handleDeleteChat,
     handleCurrent,
     handleSummaryChat,
+    handleReviewFix,
     handleCallback,
     handleText,
     handleReboot,

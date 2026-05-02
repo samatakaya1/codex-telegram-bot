@@ -20,8 +20,15 @@ describe('parseConfig', () => {
     expect(config.codexWsUrl).toBe('ws://127.0.0.1:18765');
     expect(config.codexGlobalStatePath).toBe('C:\\CodexHome\\.codex-global-state.json');
     expect(config.projectsRoot).toBe('C:\\Workspace');
+    expect(config.promptConfigDir).toBe('prompt-configs');
     expect(config.logLevel).toBe('debug');
     expect(config.botRunMode).toBe('DEV');
+  });
+
+  it('parses a custom prompt config directory', () => {
+    const config = parseConfig({ ...validEnv, PROMPT_CONFIG_DIR: 'C:\\Bot\\prompt-configs' });
+
+    expect(config.promptConfigDir).toBe('C:\\Bot\\prompt-configs');
   });
 
   it('parses PROD bot run mode', () => {
