@@ -59,7 +59,8 @@ describe('updateScopedTelegramCommandMenu', () => {
         { command: 'delete_chat', description: 'Delete a chat from the selected project' },
         { command: 'current', description: 'Show selected chat, context, and project' },
         { command: 'summary_chat', description: 'Ask Codex for selected chat summary' },
-        { command: 'review_fix', description: 'Review and fix issues in the selected chat' }
+        { command: 'review_fix', description: 'Review and fix issues in the selected chat' },
+        { command: 'commit', description: 'Commit and merge verified project changes' }
       ],
       { scope: { type: 'chat', chat_id: 42 } }
     );

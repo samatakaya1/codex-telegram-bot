@@ -27,4 +27,68 @@ export const REVIEW_FIX_PROMPT_CONFIG = {
   enabled: true
 } as const satisfies PromptConfig;
 
-export const DEFAULT_PROMPT_CONFIGS = [REVIEW_FIX_PROMPT_CONFIG] as const satisfies readonly PromptConfig[];
+export const COMMIT_PROMPT_CONFIG = {
+  schemaVersion: 1,
+  id: 'commit',
+  title: 'Commit',
+  description: 'Verify docs and checks, commit current branch work, then merge it into the integration branch.',
+  triggers: ['/commit'],
+  telegramMenuCommand: 'commit',
+  requiresSelectedChat: true,
+  workingMessage: 'Codex is verifying, committing, and merging in the selected project...',
+  prompt: [
+    'You are Codex running from the Telegram /commit command in the currently selected Codex thread.',
+    '',
+    'Objective: verify documentation freshness and project checks, commit the current branch work, create a temporary local backup branch, merge the new commit into the repository integration branch, delete the backup after a successful merge path, and leave HEAD on the integration branch. You execute inside the target repository; the Telegram bot only forwards this prompt.',
+    '',
+    'Safety rules:',
+    '- Follow AGENTS.md, README, and repository instructions.',
+    '- Do not add Telegram approval UI. If an action requires unavailable approval, stop and tell the user to continue in Codex Desktop or CLI.',
+    '- Do not push, rebase, reset, force-delete, clean files, or edit project files. This command only fetches refs, validates, stages, commits, creates or deletes a temporary local backup branch, switches branches, and merges.',
+    '- If any required fact is ambiguous, stop. Do not guess unsafe git operations.',
+    '',
+    'Procedure:',
+    '1. Confirm this is a git repository. Stop if not.',
+    '2. Confirm HEAD is on a named branch, no merge/rebase/cherry-pick/bisect is in progress, and there are no unresolved conflicts. Stop on detached HEAD or in-progress git state.',
+    '3. Run git fetch before deciding the integration branch. If the repository has remotes, run git fetch --all --prune. If fetch fails, stop before staging or committing. If the repository has no remotes, continue with local metadata and mention that fetch was skipped because no remotes exist.',
+    '4. Identify the current source branch.',
+    '5. Identify the integration branch using fetched and local git metadata:',
+    '   - Prefer a local branch matching the upstream default from refs/remotes/*/HEAD.',
+    '   - Otherwise use a documented repository default if AGENTS.md/README clearly names it.',
+    '   - Otherwise, if exactly one local branch exists among main, master, trunk, develop, use it.',
+    '   - If multiple candidates exist without clear documentation, or none exists, stop.',
+    '   - Do not create a missing local integration branch.',
+    '6. If the source branch is the integration branch, continue. The command is allowed to commit directly on the integration branch; still create the temporary backup branch after the commit, skip the branch-to-branch merge step because HEAD already contains the commit, delete the backup only after final confirmation, and leave HEAD on the integration branch.',
+    '7. Inspect staged, unstaged, and untracked non-ignored changes. If there are no committable changes, stop. If changes appear unrelated, include secrets/tokens, generated artifacts not intended for git, or cannot be safely staged together, stop with the exact concern.',
+    '8. Check documentation freshness against the changes. If README, docs, command lists, config docs, protocol notes, tests docs, changelog entries, or local project status docs are required but missing or stale, stop and report the exact documentation gap. Do not edit docs in this command.',
+    '9. Determine relevant verification commands from repository instructions and available scripts. For this repository, run npm test, npm run typecheck, and npm run build; also run lint and format-check commands if check-only scripts exist. In other repositories, run the equivalent tests, typecheck, build, lint, and format checks when present. Do not run mutating format commands.',
+    '10. If any verification command fails or reports actionable errors/warnings, stop. Include the command and the concrete failure.',
+    '11. Stage only files that are clearly part of the current work. Re-check the staged diff for secrets, unrelated changes, generated artifacts, whitespace-only noise, and conflict markers. Stop if unsafe.',
+    '12. Create a commit on the source branch. Follow repository commit-message conventions from recent history; otherwise use a concise imperative subject.',
+    '13. Confirm the worktree is clean after the commit, ignoring ignored files. Stop if non-ignored changes remain.',
+    '14. Create a temporary local backup branch at the committed source HEAD:',
+    '    telegram-commit-backup/<sanitized-source-branch>-<UTC-YYYYMMDDHHMMSS>-<short-head-sha>',
+    '    Replace characters outside [A-Za-z0-9._-] in the source branch segment with "-". If backup creation fails, stop.',
+    '15. If the source branch is not the integration branch, switch to the integration branch and merge the committed source branch into it. Use git merge --no-edit <source-branch>. Git may fast-forward or create a merge commit; a merge commit is allowed. If the merge fails or conflicts, try git merge --abort, keep the backup branch, stop, and report the exact failure.',
+    '16. If the source branch is the integration branch, confirm HEAD is still on the integration branch and contains the new commit.',
+    '17. After the merge path succeeds, delete the temporary backup branch with safe deletion. If deletion fails, report it and do not force-delete.',
+    '18. Confirm HEAD is on the integration branch.',
+    '',
+    'Final response format:',
+    '- Status: completed or stopped',
+    '- Source branch',
+    '- Integration branch',
+    '- Commit SHA and subject, if created',
+    '- Backup branch: deleted, kept, or not created',
+    '- Documentation check result',
+    '- Verification commands run and result',
+    '- If stopped: exact stop reason and the next manual action',
+    'Keep the response concise and do not reveal chain-of-thought.'
+  ].join('\n'),
+  enabled: true
+} as const satisfies PromptConfig;
+
+export const DEFAULT_PROMPT_CONFIGS = [
+  REVIEW_FIX_PROMPT_CONFIG,
+  COMMIT_PROMPT_CONFIG
+] as const satisfies readonly PromptConfig[];

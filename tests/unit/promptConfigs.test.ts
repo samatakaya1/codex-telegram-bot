@@ -5,7 +5,11 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import { promptConfigSchema } from '../../src/domain/promptConfigs.js';
-import { REVIEW_FIX_PROMPT_CONFIG } from '../../src/promptConfigs/defaults.js';
+import {
+  COMMIT_PROMPT_CONFIG,
+  DEFAULT_PROMPT_CONFIGS,
+  REVIEW_FIX_PROMPT_CONFIG
+} from '../../src/promptConfigs/defaults.js';
 import {
   bootstrapPromptConfigDefaults,
   loadPromptConfigs
@@ -35,6 +39,24 @@ describe('prompt config storage', () => {
     expect(REVIEW_FIX_PROMPT_CONFIG.id).toBe('review_fix');
     expect(REVIEW_FIX_PROMPT_CONFIG.triggers).toEqual(['/review_fix']);
     expect(REVIEW_FIX_PROMPT_CONFIG.telegramMenuCommand).toBe('review_fix');
+  });
+
+  it('keeps the shipped commit default valid and aligned with commit safety decisions', () => {
+    expect(promptConfigSchema.safeParse(COMMIT_PROMPT_CONFIG).success).toBe(true);
+    expect(COMMIT_PROMPT_CONFIG.id).toBe('commit');
+    expect(COMMIT_PROMPT_CONFIG.triggers).toEqual(['/commit']);
+    expect(COMMIT_PROMPT_CONFIG.telegramMenuCommand).toBe('commit');
+    expect(COMMIT_PROMPT_CONFIG.prompt).toContain('git fetch');
+    expect(COMMIT_PROMPT_CONFIG.prompt).toContain('If the source branch is the integration branch');
+    expect(COMMIT_PROMPT_CONFIG.prompt).toContain('merge commit');
+  });
+
+  it('bootstraps all built-in default prompt files', async () => {
+    const dir = await tempPromptConfigDir();
+    await bootstrapPromptConfigDefaults(dir, DEFAULT_PROMPT_CONFIGS);
+
+    await expect(readFile(path.join(dir, 'review_fix.json'), 'utf8')).resolves.toContain('"id": "review_fix"');
+    await expect(readFile(path.join(dir, 'commit.json'), 'utf8')).resolves.toContain('"id": "commit"');
   });
 
   it('bootstraps editable default files without overwriting user edits', async () => {

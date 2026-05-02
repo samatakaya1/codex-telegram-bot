@@ -81,6 +81,7 @@ export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
   bot.command('current', (ctx) => handlers.handleCurrent(toHandlerContext(ctx)));
   bot.command('summary_chat', (ctx) => handlers.handleSummaryChat(toHandlerContext(ctx)));
   bot.command('review_fix', (ctx) => handlers.handleReviewFix(toHandlerContext(ctx)));
+  bot.command('commit', (ctx) => handlers.handleCommit(toHandlerContext(ctx)));
   bot.command('reboot', (ctx) => handlers.handleReboot(toHandlerContext(ctx)));
   bot.on('callback_query:data', (ctx) => handlers.handleCallback(toHandlerContext(ctx)));
   bot.on('message:text', (ctx) => handlers.handleText(toHandlerContext(ctx)));

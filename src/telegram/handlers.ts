@@ -90,9 +90,16 @@ const SUMMARY_CHAT_PROMPT =
   ].join(' ');
 const SUMMARY_CHAT_WORKING_MESSAGE = 'Codex is preparing chat summary...';
 const REVIEW_FIX_CONFIG_ID = 'review_fix';
+const COMMIT_CONFIG_ID = 'commit';
 const CREATE_PROJECT_CHAT_BUTTON = 'Создать новый чат';
 const SELECT_PROJECT_CHAT_BUTTON = 'Выбрать чат';
 const PROJECT_UNAVAILABLE_MESSAGE = 'This project is no longer available. Run /select_project again.';
+
+type PromptBackedCommandOptions = {
+  configId: string;
+  command: string;
+  configFileName: string;
+};
 
 type SelectedChat = {
   threadId: string;
@@ -408,6 +415,25 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
   }
 
   async function handleReviewFix(ctx: TelegramHandlerContext): Promise<void> {
+    await handlePromptBackedCommand(ctx, {
+      configId: REVIEW_FIX_CONFIG_ID,
+      command: '/review_fix',
+      configFileName: 'review_fix.json'
+    });
+  }
+
+  async function handleCommit(ctx: TelegramHandlerContext): Promise<void> {
+    await handlePromptBackedCommand(ctx, {
+      configId: COMMIT_CONFIG_ID,
+      command: '/commit',
+      configFileName: 'commit.json'
+    });
+  }
+
+  async function handlePromptBackedCommand(
+    ctx: TelegramHandlerContext,
+    options: PromptBackedCommandOptions
+  ): Promise<void> {
     if (!(await requireAccess(ctx))) {
       return;
     }
@@ -425,24 +451,33 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
-      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before requesting /review_fix.');
+      await safeReply(
+        ctx,
+        `A Codex turn is already running for this chat. Wait for it to finish before requesting ${options.command}.`
+      );
       return;
     }
 
     const pending = reservePendingTurn(ctx, selected);
     let config: PromptConfig | null;
     try {
-      config = await promptConfigs.getPromptConfig(REVIEW_FIX_CONFIG_ID);
+      config = await promptConfigs.getPromptConfig(options.configId);
     } catch {
       if (releasePendingTurn(selected.threadId, pending)) {
-        await safeReply(ctx, 'Could not load /review_fix prompt config. Check prompt-configs/review_fix.json and try again.');
+        await safeReply(
+          ctx,
+          `Could not load ${options.command} prompt config. Check prompt-configs/${options.configFileName} and try again.`
+        );
       }
       return;
     }
 
     if (config === null || !config.enabled) {
       if (releasePendingTurn(selected.threadId, pending)) {
-        await safeReply(ctx, '/review_fix prompt config is unavailable. Check prompt-configs/review_fix.json and try again.');
+        await safeReply(
+          ctx,
+          `${options.command} prompt config is unavailable. Check prompt-configs/${options.configFileName} and try again.`
+        );
       }
       return;
     }
@@ -1105,6 +1140,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     handleCurrent,
     handleSummaryChat,
     handleReviewFix,
+    handleCommit,
     handleCallback,
     handleText,
     handleReboot,
