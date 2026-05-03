@@ -3,6 +3,7 @@ dist/
 logs/
 .tmp/
 tmp/
+.worktrees/
 prompt-configs/
 
 # Local environment
