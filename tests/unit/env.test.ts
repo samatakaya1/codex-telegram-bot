@@ -12,7 +12,7 @@ const validEnv = {
 };
 
 describe('parseConfig', () => {
-  it('parses the owner-only MVP configuration', () => {
+  it('parses the owner-only configuration', () => {
     const config = parseConfig(validEnv);
 
     expect(config.telegramBotToken).toBe('123456:token');

@@ -43,7 +43,7 @@ BOT_RUN_MODE=DEV
 
 `.env` is local-only and must not be committed. Keep real Telegram tokens out of documentation, fixtures, logs, and git history.
 
-Only Telegram user id `<TELEGRAM_OWNER_ID>` is accepted. The MVP rejects group and supergroup chats even for the owner.
+Only Telegram user id `<TELEGRAM_OWNER_ID>` is accepted. Group and supergroup chats are rejected even for the owner.
 
 ## Commands
 

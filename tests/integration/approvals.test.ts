@@ -52,7 +52,7 @@ function makeHandlers() {
 }
 
 describe('approval callbacks', () => {
-  it('does not render or accept Telegram approval callbacks in MVP fail-closed mode', async () => {
+  it('does not render or accept Telegram approval callbacks in fail-closed mode', async () => {
     const { handlers, codex } = makeHandlers();
     const { ctx, replies } = makeContext('a:unsupported:yes');
 

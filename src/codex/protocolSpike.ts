@@ -425,7 +425,7 @@ export async function runProtocolSpike(): Promise<void> {
     });
     notes.push('`turn/start` response includes `turn.id`; active Telegram responses must be correlated by `threadId` and `turnId`.');
     notes.push('Approval requests were not intentionally triggered by this spike. Until exact successful approval response shapes are captured, Telegram approval buttons must not be rendered.');
-    notes.push('MVP approval fallback: notify the owner that approval is unsupported in Telegram, send a JSON-RPC error response to the server request id when one is present, never auto-approve, and clear busy state only on matching terminal turn event or confirmed app-server connection loss.');
+    notes.push('Approval fallback: notify the owner that approval is unsupported in Telegram, send a JSON-RPC error response to the server request id when one is present, never auto-approve, and clear busy state only on matching terminal turn event or confirmed app-server connection loss.');
     notes.push(...sideEffects.map((item) => `Side effect: ${item}. Cleanup is manual in Codex Desktop.`));
 
     await Promise.all(records.map((record) => writeFixture(record)));
