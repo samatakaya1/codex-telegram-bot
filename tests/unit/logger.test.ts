@@ -51,6 +51,21 @@ describe('logger', () => {
         codexEvent: { method: 'turn/start', params: { text: 'raw codex event' } },
         approvalPayload: { command: 'raw approval payload' },
         approvalRequest: { method: 'approval/request', params: { command: 'raw approval params' } },
+        transcript: 'raw voice transcript',
+        voiceTranscript: 'raw voice transcript nested',
+        audioPath: 'C:\\Bot\\.tmp\\voice\\secret.ogg',
+        modelPath: 'C:\\Bot\\.local\\voice\\models\\secret-model',
+        whisperModelPath: 'C:\\Bot\\.local\\voice\\models\\secret-whisper-model',
+        WHISPER_MODEL_PATH: 'C:\\Bot\\.local\\voice\\models\\secret-env-model',
+        path: 'C:\\Bot\\.tmp\\voice\\secret-path.ogg',
+        filePath: 'C:\\Bot\\.tmp\\voice\\secret-file-path.ogg',
+        tmpPath: 'C:\\Bot\\.tmp\\voice\\secret-tmp-path.ogg',
+        downloadedPath: 'C:\\Bot\\.tmp\\voice\\secret-downloaded-path.ogg',
+        fileUrl: 'https://api.telegram.org/file/bot123456:secret-token/voice/file.ogg',
+        file_path: 'voice/file-secret.ogg',
+        telegramFilePath: 'voice/telegram-secret.ogg',
+        stdout: 'stdout with private transcript',
+        stderr: 'stderr with private audio path',
         nested: { botToken: 'nested-token-secret' }
       },
       'redaction check'
@@ -75,6 +90,20 @@ describe('logger', () => {
     expect(output).not.toContain('raw codex event');
     expect(output).not.toContain('raw approval payload');
     expect(output).not.toContain('raw approval params');
+    expect(output).not.toContain('raw voice transcript');
+    expect(output).not.toContain('secret.ogg');
+    expect(output).not.toContain('secret-model');
+    expect(output).not.toContain('secret-whisper-model');
+    expect(output).not.toContain('secret-env-model');
+    expect(output).not.toContain('secret-path.ogg');
+    expect(output).not.toContain('secret-file-path.ogg');
+    expect(output).not.toContain('secret-tmp-path.ogg');
+    expect(output).not.toContain('secret-downloaded-path.ogg');
+    expect(output).not.toContain('secret-token');
+    expect(output).not.toContain('file-secret');
+    expect(output).not.toContain('telegram-secret');
+    expect(output).not.toContain('stdout with private transcript');
+    expect(output).not.toContain('stderr with private audio path');
     expect(output).not.toContain('nested-token-secret');
   });
 });

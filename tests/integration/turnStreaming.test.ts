@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AppConfig } from '../../src/config/env.js';
+import { DEFAULT_VOICE_TRANSCRIPTION_CONFIG, type AppConfig } from '../../src/config/env.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from '../../src/telegram/handlers.js';
 
 const ownerId = 42;
@@ -14,23 +14,36 @@ function config(): AppConfig {
     projectsRoot: 'C:\\Workspace',
     promptConfigDir: 'prompt-configs',
     logLevel: 'info',
-    botRunMode: 'DEV'
+    botRunMode: 'DEV',
+    voiceTranscription: DEFAULT_VOICE_TRANSCRIPTION_CONFIG
   };
 }
 
-function makeContext(text = 'hello') {
+function makeContext(text = 'hello', overrides: Partial<TelegramHandlerContext> = {}) {
   const replies: string[] = [];
+  const replyOptions: unknown[] = [];
   const ctx: TelegramHandlerContext = {
     fromId: ownerId,
     chatId: ownerId,
     chatType: 'private',
     text,
-    reply: async (replyText) => {
+    reply: async (replyText, options) => {
       replies.push(replyText);
+      replyOptions.push(options);
     },
-    answerCallbackQuery: vi.fn()
+    answerCallbackQuery: vi.fn(),
+    ...overrides
   };
-  return { ctx, replies };
+  return { ctx, replies, replyOptions };
+}
+
+function inlineButtons(replyOptions: unknown[]): Array<{ text: string; callback_data?: string }> {
+  return replyOptions.flatMap((options) => {
+    const candidate = options as {
+      reply_markup?: { inline_keyboard?: Array<Array<{ text: string; callback_data?: string }>> };
+    };
+    return candidate.reply_markup?.inline_keyboard?.flat() ?? [];
+  });
 }
 
 function dependencies() {
@@ -99,6 +112,33 @@ describe('turn streaming delivery', () => {
     expect(replies.join('\n')).toContain('/select_project');
     expect(replies.join('\n')).not.toContain('/new_project_chat');
     expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('streams a Codex response after a confirmed voice transcript', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'voice prompt text' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext('', { voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+
+    await handlers.handleVoice(voice.ctx);
+    const sendCallbackData = inlineButtons(voice.replyOptions).find((button) => button.text === 'Send to Codex')
+      ?.callback_data;
+    const confirm = makeContext('', { callbackData: sendCallbackData });
+    await handlers.handleCallback(confirm.ctx);
+
+    deps.emitDelta({ threadId: 'thread-1', turnId: 'turn-1', delta: 'voice answer' });
+    deps.emitCompleted({ threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } });
+
+    await vi.waitFor(() => expect(confirm.replies.join('\n')).toContain('voice answer'));
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: 'voice prompt text' });
   });
 
   it('rejects a second prompt while the selected thread is busy', async () => {

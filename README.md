@@ -26,6 +26,57 @@ Use `BOT_RUN_MODE=DEV` to run the bot with `npm run dev`.
 
 Use `BOT_RUN_MODE=PROD` to run `npm run build`, then start the bot with `npm start`.
 
+## Local Voice Transcription
+
+Voice messages can be transcribed locally before they are sent to Codex. This does not use the OpenAI API. The bot downloads the Telegram voice file, runs local `faster-whisper`, shows the recognized text in Telegram, and sends it to Codex only after the owner presses `Send to Codex`.
+
+Fresh clone setup on Windows:
+
+```powershell
+npm ci
+Copy-Item .env.example .env
+# Edit .env: fill Telegram/Codex/project values, then set VOICE_TRANSCRIPTION_ENABLED=true.
+npm run voice:setup
+npm run voice:model:download
+npm run voice:doctor
+npm run voice:smoke
+npm run service
+```
+
+`voice:doctor` checks prerequisites and does not install anything. `voice:setup` creates a local Python virtual environment under `.local/voice/faster-whisper/.venv` and installs the local Windows CUDA runtime DLL packages required by `faster-whisper`. `voice:model:download` downloads `Systran/faster-whisper-large-v3` under `.local/voice/models/faster-whisper-large-v3`. `voice:smoke` verifies the local CUDA/faster-whisper setup can load the model and run a tiny transcription.
+
+Expected local disk usage is roughly 4-5 GB: about 2.9 GB for `large-v3`, plus local Python, CUDA runtime, cuBLAS, and cuDNN packages in `.local/voice/faster-whisper/.venv`.
+
+Local voice artifacts are ignored by git:
+
+```text
+.local/voice/
+.tmp/voice/
+```
+
+Set in `.env` after setup:
+
+```env
+VOICE_TRANSCRIPTION_ENABLED=true
+VOICE_TRANSCRIPTION_BACKEND=faster-whisper
+VOICE_TRANSCRIPTION_TMP_DIR=.tmp/voice
+VOICE_TRANSCRIPTION_MAX_FILE_MB=20
+VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS=600
+VOICE_TRANSCRIPTION_TIMEOUT_SECONDS=120
+VOICE_TRANSCRIPTION_PREVIEW_MAX_CHARS=3500
+VOICE_TRANSCRIPTION_MAX_TEXT_CHARS=12000
+FASTER_WHISPER_PYTHON=.local/voice/faster-whisper/.venv/Scripts/python.exe
+HF_HOME=.local/voice/hf-cache
+WHISPER_MODEL_PATH=.local/voice/models/faster-whisper-large-v3
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE_TYPE=float16
+WHISPER_LANGUAGE=auto
+WHISPER_BEAM_SIZE=5
+WHISPER_VAD_FILTER=true
+```
+
+If voice transcription is disabled or local setup is missing, text commands and text prompts continue to work normally.
+
 ## Telegram Setup
 
 Edit `.env`:
@@ -39,6 +90,22 @@ PROJECTS_ROOT=<PROJECTS_ROOT>
 PROMPT_CONFIG_DIR=prompt-configs
 LOG_LEVEL=info
 BOT_RUN_MODE=DEV
+VOICE_TRANSCRIPTION_ENABLED=false
+VOICE_TRANSCRIPTION_BACKEND=faster-whisper
+VOICE_TRANSCRIPTION_TMP_DIR=.tmp/voice
+VOICE_TRANSCRIPTION_MAX_FILE_MB=20
+VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS=600
+VOICE_TRANSCRIPTION_TIMEOUT_SECONDS=120
+VOICE_TRANSCRIPTION_PREVIEW_MAX_CHARS=3500
+VOICE_TRANSCRIPTION_MAX_TEXT_CHARS=12000
+FASTER_WHISPER_PYTHON=.local/voice/faster-whisper/.venv/Scripts/python.exe
+HF_HOME=.local/voice/hf-cache
+WHISPER_MODEL_PATH=.local/voice/models/faster-whisper-large-v3
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE_TYPE=float16
+WHISPER_LANGUAGE=auto
+WHISPER_BEAM_SIZE=5
+WHISPER_VAD_FILTER=true
 ```
 
 `.env` is local-only and must not be committed. Keep real Telegram tokens out of documentation, fixtures, logs, and git history.
@@ -72,6 +139,7 @@ Always supported:
 
 - `?` or `/` - text shortcuts that show available commands.
 - Plain text - send a prompt to the selected Codex chat.
+- Voice message - when local voice transcription is enabled, transcribe locally, show a confirmation preview, then send the confirmed text to the selected Codex chat.
 
 Telegram clients may cache command menus briefly; command handlers are the source of truth.
 
@@ -99,6 +167,7 @@ The bot creates missing built-in default prompt files on first use. Users can ed
 - Logs redact bot tokens, authorization headers, raw Telegram updates, raw Codex protocol events, and raw approval payloads by default.
 - Keep the old Telegram notification bridge disabled while this bot owns the same Telegram bot/chat.
 - Local runtime artifacts such as `.env`, `dist/`, `logs/`, `.tmp/`, and `node_modules/` are ignored by git.
+- Local voice runtime artifacts such as `.local/voice/`, `.tmp/voice/`, downloaded Telegram voice files, and local models are ignored by git.
 
 ## Failure Handling
 
@@ -134,11 +203,20 @@ Manual Telegram acceptance for the startup notification and `Выбрать пр
 19. Send a second message while Codex is answering; verify it is rejected.
 20. Try a non-owner user and a group chat; verify no Codex call happens.
 21. Ask for a long answer; verify Telegram replies are split into ordered chunks.
-22. Run `/reboot`; after restart, verify the command menu returns to the base no-project commands until a project is selected again.
-23. During an active turn, simulate a WebSocket connection loss while the bot remains alive; verify no duplicate prompt is sent, Telegram receives a clear failure notice, and `/status` reports reconnecting or disconnected.
-24. Separately kill the supervisor-managed app-server; verify the supervisor sends an owner notice and stops the bot.
-25. Trigger an approval-requiring Codex action if available; verify it fails closed and the owner gets a Telegram notice to continue in Codex Desktop or CLI.
-26. Inspect logs; verify bot tokens, authorization headers, raw Telegram updates, raw Codex events, approval payloads, outgoing Telegram delivery payloads, and command-menu update failures are not printed with raw payload text.
+22. With `VOICE_TRANSCRIPTION_ENABLED=false`, send a voice message; verify no file is downloaded and Telegram returns a clear disabled message.
+23. With voice enabled but without local setup, send a voice message; verify Telegram returns a clear local setup error and text prompts still work.
+24. With voice enabled and `voice:smoke` passing, send short Russian and English voice messages; verify Telegram shows the recognized text with `Send to Codex`, `Copy`, and `Cancel` buttons.
+25. Press `Cancel`; verify no Codex turn starts.
+26. Send another voice message and press `Send to Codex`; verify the exact shown transcript is sent to Codex and the Codex response returns to Telegram.
+27. Send a voice message that produces a long transcript; verify Telegram preview is truncated with a clear notice, `Copy first 256` copies a 256-character prefix, and the full configured transcript is sent after confirmation.
+28. Send a second text or voice message while a voice transcript is awaiting confirmation; verify it is rejected until `Send to Codex`, `Cancel`, or expiry.
+29. Restart the bot while a voice confirmation is pending; verify old buttons expire and do not start a Codex turn.
+30. Try oversized and too-long voice messages; verify they are rejected before Codex is called.
+31. Run `/reboot`; after restart, verify the command menu returns to the base no-project commands until a project is selected again.
+32. During an active turn, simulate a WebSocket connection loss while the bot remains alive; verify no duplicate prompt is sent, Telegram receives a clear failure notice, and `/status` reports reconnecting or disconnected.
+33. Separately kill the supervisor-managed app-server; verify the supervisor sends an owner notice and stops the bot.
+34. Trigger an approval-requiring Codex action if available; verify it fails closed and the owner gets a Telegram notice to continue in Codex Desktop or CLI.
+35. Inspect logs; verify bot tokens, authorization headers, raw Telegram updates, raw Codex events, approval payloads, outgoing Telegram delivery payloads, command-menu update failures, Telegram file URLs, local audio paths, model paths, helper stdout/stderr, and voice transcripts are not printed with raw payload text.
 
 ## Verification
 
@@ -146,4 +224,6 @@ Manual Telegram acceptance for the startup notification and `Выбрать пр
 npm test
 npm run typecheck
 npm run build
+npm run voice:doctor
+npm run voice:smoke
 ```

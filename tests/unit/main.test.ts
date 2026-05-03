@@ -28,7 +28,7 @@ describe('runtime shutdown', () => {
   it('still closes Codex when Telegram stop fails', async () => {
     const bot = {
       stop: vi.fn(async () => {
-        throw new Error('polling stop failed');
+        throw new Error('polling stop failed C:\\Bot\\.tmp\\voice\\secret.ogg');
       })
     };
     const codex = { close: vi.fn() };
@@ -38,7 +38,24 @@ describe('runtime shutdown', () => {
     await shutdown('SIGTERM');
 
     expect(codex.close).toHaveBeenCalledTimes(1);
-    expect(logger.error).toHaveBeenCalledWith({ error: expect.any(Error) }, 'Telegram polling stop failed');
+    expect(logger.error).toHaveBeenCalledWith({ runtimeError: { name: 'Error' } }, 'Telegram polling stop failed');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('secret.ogg');
+  });
+
+  it('logs sanitized Codex websocket close failures during shutdown', async () => {
+    const bot = { stop: vi.fn(async () => undefined) };
+    const codex = {
+      close: vi.fn(() => {
+        throw new Error('close failed wss://token@example.local');
+      })
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    await shutdown('SIGTERM');
+
+    expect(logger.error).toHaveBeenCalledWith({ runtimeError: { name: 'Error' } }, 'Codex websocket close failed');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('token@example.local');
   });
 
   it('wires SIGINT and SIGTERM to graceful shutdown', async () => {
@@ -134,6 +151,99 @@ describe('runtime shutdown', () => {
       scope: { type: 'chat', chat_id: 42 }
     });
     expect(calls).toEqual(['commands', 'commands', 'start']);
+  });
+
+  it('runs optional voice temp cleanup before Telegram polling starts', async () => {
+    const calls: string[] = [];
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => {
+          calls.push('commands');
+        }),
+        sendMessage: vi.fn(async () => undefined)
+      },
+      start: vi.fn(async () => {
+        calls.push('start');
+      }),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+    const cleanupVoiceTempFiles = vi.fn(async () => {
+      calls.push('voice-cleanup');
+    });
+
+    await expect(
+      startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: 42, cleanupVoiceTempFiles })
+    ).resolves.toBe('started');
+
+    expect(cleanupVoiceTempFiles).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual(['commands', 'commands', 'voice-cleanup', 'start']);
+  });
+
+  it('logs sanitized Codex connect failures without blocking startup', async () => {
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(async () => undefined)
+      },
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => {
+        throw new Error('connect failed ws://token@example.local');
+      }),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    await expect(startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: 42 })).resolves.toBe('started');
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      { runtimeError: { name: 'Error' } },
+      'Codex app-server unavailable; reconnect will continue in the background'
+    );
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('token@example.local');
+  });
+
+  it('logs voice temp cleanup failures without raw local paths', async () => {
+    const bot = {
+      api: {
+        setMyCommands: vi.fn(async () => undefined),
+        sendMessage: vi.fn(async () => undefined)
+      },
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined)
+    };
+    const codex = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn()
+    };
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const shutdown = createRuntimeShutdown({ bot, codex, logger });
+
+    await startRuntime({
+      bot,
+      codex,
+      logger,
+      shutdown,
+      telegramOwnerId: 42,
+      cleanupVoiceTempFiles: async () => {
+        throw new Error('failed to remove C:\\Bot\\.tmp\\voice\\secret.ogg');
+      }
+    });
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      { voiceCleanupError: { name: 'Error' } },
+      'Voice temp cleanup failed'
+    );
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret.ogg');
   });
 
   it('sends the owner a startup notification with a select-project button when polling starts', async () => {

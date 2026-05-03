@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AppConfig } from '../../src/config/env.js';
+import { DEFAULT_VOICE_TRANSCRIPTION_CONFIG, type AppConfig } from '../../src/config/env.js';
 import type { CodexThread } from '../../src/codex/protocol.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from '../../src/telegram/handlers.js';
 
@@ -16,7 +16,8 @@ function config(): AppConfig {
     projectsRoot: 'C:\\Workspace',
     promptConfigDir: 'prompt-configs',
     logLevel: 'info',
-    botRunMode: 'DEV'
+    botRunMode: 'DEV',
+    voiceTranscription: DEFAULT_VOICE_TRANSCRIPTION_CONFIG
   };
 }
 

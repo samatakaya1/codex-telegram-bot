@@ -23,4 +23,16 @@ describe('package scripts', () => {
 
     expect(packageJson.scripts?.service).toBe('tsx src/supervisor/main.ts');
   });
+
+  it('exposes local voice setup scripts without adding a second service entrypoint', async () => {
+    const packageJson = await readPackageJson();
+
+    expect(packageJson.scripts?.['voice:doctor']).toBe('powershell -ExecutionPolicy Bypass -File scripts/voice/doctor.ps1');
+    expect(packageJson.scripts?.['voice:setup']).toBe('powershell -ExecutionPolicy Bypass -File scripts/voice/setup.ps1');
+    expect(packageJson.scripts?.['voice:model:download']).toBe(
+      'powershell -ExecutionPolicy Bypass -File scripts/voice/download-model.ps1'
+    );
+    expect(packageJson.scripts?.['voice:smoke']).toBe('powershell -ExecutionPolicy Bypass -File scripts/voice/smoke.ps1');
+    expect(packageJson.scripts).not.toHaveProperty('service:voice');
+  });
 });

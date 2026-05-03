@@ -7,8 +7,10 @@ import { DEFAULT_PROMPT_CONFIGS } from '../promptConfigs/defaults.js';
 import { requestProcessReboot } from '../runtime/reboot.js';
 import { readProjectlessThreadIds } from '../storage/codexGlobalState.js';
 import { createFilePromptConfigStore, type PromptConfigStore } from '../storage/promptConfigs.js';
+import { createTelegramVoiceDownloader, deleteDownloadedVoiceFile } from '../voice/telegramFileDownloader.js';
+import { createFasterWhisperTranscriber } from '../voice/transcriber.js';
 import { telegramCommandsForState } from './commands.js';
-import { createTelegramHandlers, type TelegramHandlerContext } from './handlers.js';
+import { createTelegramHandlers, type TelegramHandlerContext, type TelegramVoiceMessage } from './handlers.js';
 
 type CreateTelegramBotOptions = {
   config: AppConfig;
@@ -51,6 +53,14 @@ export async function updateScopedTelegramCommandMenu(options: {
 
 export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
   const bot = new Bot(options.config.telegramBotToken);
+  const voiceDownloader = createTelegramVoiceDownloader({
+    botToken: options.config.telegramBotToken,
+    tmpDir: options.config.voiceTranscription.tmpDir,
+    maxFileBytes: options.config.voiceTranscription.maxFileMb * 1024 * 1024,
+    downloadTimeoutMs: options.config.voiceTranscription.timeoutSeconds * 1000,
+    getFile: async (fileId) => bot.api.getFile(fileId)
+  });
+  const voiceTranscriber = createFasterWhisperTranscriber(options.config.voiceTranscription);
   const handlers = createTelegramHandlers({
     config: options.config,
     codex: options.codex,
@@ -63,6 +73,10 @@ export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
         defaults: DEFAULT_PROMPT_CONFIGS,
         logger: options.logger
       }),
+    downloadVoiceFile: (params) => voiceDownloader.download(params),
+    deleteVoiceFile: deleteDownloadedVoiceFile,
+    transcribeVoice: (audioPath) => voiceTranscriber.transcribe(audioPath),
+    logger: options.logger,
     onRebootRequested: options.onRebootRequested ?? requestProcessReboot,
     onDeliveryError: (error) => options.logger?.error({ telegramError: sanitizeTelegramError(error) }, 'Telegram delivery failed'),
     updateCommandMenu: async (chatId, hasSelectedChat) => {
@@ -84,6 +98,7 @@ export function createTelegramBot(options: CreateTelegramBotOptions): Bot {
   bot.command('commit', (ctx) => handlers.handleCommit(toHandlerContext(ctx)));
   bot.command('reboot', (ctx) => handlers.handleReboot(toHandlerContext(ctx)));
   bot.on('callback_query:data', (ctx) => handlers.handleCallback(toHandlerContext(ctx)));
+  bot.on('message:voice', (ctx) => handlers.handleVoice(toHandlerContext(ctx)));
   bot.on('message:text', (ctx) => handlers.handleText(toHandlerContext(ctx)));
   bot.catch(() => {
     // User-facing handlers catch expected failures; this keeps unexpected middleware errors from stopping polling.
@@ -98,6 +113,7 @@ function toHandlerContext(ctx: Context): TelegramHandlerContext {
     chatId: ctx.chat?.id,
     chatType: ctx.chat?.type,
     text: ctx.message?.text,
+    voice: voiceMessageFromContext(ctx),
     callbackData: ctx.callbackQuery?.data,
     reply: async (text, options) => {
       await ctx.reply(text, options as Parameters<Context['reply']>[1]);
@@ -108,6 +124,21 @@ function toHandlerContext(ctx: Context): TelegramHandlerContext {
       }
     },
     confirmUpdate: () => confirmTelegramUpdate(ctx)
+  };
+}
+
+export function voiceMessageFromContext(ctx: Pick<Context, 'message'>): TelegramVoiceMessage | undefined {
+  const voice = ctx.message?.voice;
+  if (voice === undefined) {
+    return undefined;
+  }
+
+  return {
+    fileId: voice.file_id,
+    fileUniqueId: voice.file_unique_id,
+    durationSeconds: voice.duration,
+    mimeType: voice.mime_type,
+    fileSizeBytes: voice.file_size
   };
 }
 

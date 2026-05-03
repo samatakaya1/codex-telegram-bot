@@ -8,6 +8,7 @@ import { telegramCommandsForState, type TelegramCommandDefinition } from './tele
 import { createTelegramBot, sanitizeTelegramError } from './telegram/bot.js';
 import { STARTUP_NOTIFICATION_MESSAGE, startupNotificationOptions } from './telegram/startup.js';
 import { createLogger } from './utils/logger.js';
+import { cleanupOldVoiceTempFiles } from './voice/telegramFileDownloader.js';
 
 type StartupNotificationOptions = ReturnType<typeof startupNotificationOptions>;
 
@@ -67,6 +68,7 @@ type StartRuntimeDependencies = {
   logger: RuntimeLogger;
   shutdown: RuntimeShutdown;
   telegramOwnerId: number;
+  cleanupVoiceTempFiles?: () => Promise<void> | void;
 };
 
 type StartRuntimeResult = 'started' | 'shutdown-requested';
@@ -96,7 +98,19 @@ export async function run(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   );
 
   try {
-    await startRuntime({ bot, codex, logger, shutdown, telegramOwnerId: config.telegramOwnerId });
+    await startRuntime({
+      bot,
+      codex,
+      logger,
+      shutdown,
+      telegramOwnerId: config.telegramOwnerId,
+      cleanupVoiceTempFiles: async () => {
+        await cleanupOldVoiceTempFiles({
+          tmpDir: config.voiceTranscription.tmpDir,
+          maxAgeMs: 24 * 60 * 60 * 1000
+        });
+      }
+    });
   } finally {
     removeShutdownHandlers();
     codex.close();
@@ -145,10 +159,27 @@ export async function startRuntime(deps: StartRuntimeDependencies): Promise<Star
     return 'shutdown-requested';
   }
 
+  await cleanupVoiceTempFiles(deps);
+  if (deps.shutdown.isRequested()) {
+    return 'shutdown-requested';
+  }
+
   await deps.bot.start({
     onStart: () => scheduleStartupNotification(deps.bot, deps.logger, deps.telegramOwnerId)
   });
   return 'started';
+}
+
+async function cleanupVoiceTempFiles(deps: Pick<StartRuntimeDependencies, 'cleanupVoiceTempFiles' | 'logger'>): Promise<void> {
+  try {
+    await Promise.resolve(deps.cleanupVoiceTempFiles?.());
+  } catch (error) {
+    deps.logger.warn({ voiceCleanupError: sanitizeErrorForLog(error) }, 'Voice temp cleanup failed');
+  }
+}
+
+function sanitizeErrorForLog(error: unknown): { name: string } {
+  return { name: error instanceof Error ? error.name : typeof error };
 }
 
 function scheduleStartupNotification(bot: RuntimeBot, logger: RuntimeLogger, telegramOwnerId: number): void {
@@ -203,13 +234,13 @@ export function createRuntimeShutdown(deps: ShutdownDependencies): RuntimeShutdo
     try {
       await Promise.resolve(deps.bot.stop());
     } catch (error) {
-      deps.logger.error({ error }, 'Telegram polling stop failed');
+      deps.logger.error({ runtimeError: sanitizeErrorForLog(error) }, 'Telegram polling stop failed');
     }
 
     try {
       deps.codex.close();
     } catch (error) {
-      deps.logger.error({ error }, 'Codex websocket close failed');
+      deps.logger.error({ runtimeError: sanitizeErrorForLog(error) }, 'Codex websocket close failed');
     }
   };
 
@@ -240,7 +271,7 @@ async function connectCodex(codex: RuntimeCodexClient, logger: RuntimeLogger): P
     await codex.connect();
     logger.info({}, 'Connected to Codex app-server');
   } catch (error) {
-    logger.warn({ error }, 'Codex app-server unavailable; reconnect will continue in the background');
+    logger.warn({ runtimeError: sanitizeErrorForLog(error) }, 'Codex app-server unavailable; reconnect will continue in the background');
   }
 }
 
@@ -249,7 +280,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
     .then(() => run())
     .catch((error: unknown) => {
       const logger = createLogger({ logLevel: 'error' });
-      logger.error({ error }, 'Codex Telegram app-server bot failed');
+      logger.error({ runtimeError: sanitizeErrorForLog(error) }, 'Codex Telegram app-server bot failed');
       process.exitCode = 1;
     });
 }

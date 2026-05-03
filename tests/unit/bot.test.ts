@@ -1,7 +1,12 @@
 import type { Context } from 'grammy';
 import { describe, expect, it, vi } from 'vitest';
 
-import { confirmTelegramUpdate, sanitizeTelegramError, updateScopedTelegramCommandMenu } from '../../src/telegram/bot.js';
+import {
+  confirmTelegramUpdate,
+  sanitizeTelegramError,
+  updateScopedTelegramCommandMenu,
+  voiceMessageFromContext
+} from '../../src/telegram/bot.js';
 
 describe('confirmTelegramUpdate', () => {
   it('confirms the current Telegram update by requesting the next offset', async () => {
@@ -13,6 +18,30 @@ describe('confirmTelegramUpdate', () => {
     } as unknown as Pick<Context, 'api' | 'update'>);
 
     expect(api.getUpdates).toHaveBeenCalledWith({ offset: 124, limit: 1, timeout: 0 });
+  });
+});
+
+describe('voiceMessageFromContext', () => {
+  it('extracts normalized Telegram voice metadata without raw payload fields', () => {
+    const voice = voiceMessageFromContext({
+      message: {
+        voice: {
+          file_id: 'file-id',
+          file_unique_id: 'unique-id',
+          duration: 4,
+          mime_type: 'audio/ogg',
+          file_size: 1024
+        }
+      }
+    } as unknown as Pick<Context, 'message'>);
+
+    expect(voice).toEqual({
+      fileId: 'file-id',
+      fileUniqueId: 'unique-id',
+      durationSeconds: 4,
+      mimeType: 'audio/ogg',
+      fileSizeBytes: 1024
+    });
   });
 });
 

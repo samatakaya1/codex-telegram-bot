@@ -13,7 +13,11 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "voice:doctor": "powershell -ExecutionPolicy Bypass -File scripts/voice/doctor.ps1",
+    "voice:setup": "powershell -ExecutionPolicy Bypass -File scripts/voice/setup.ps1",
+    "voice:model:download": "powershell -ExecutionPolicy Bypass -File scripts/voice/download-model.ps1",
+    "voice:smoke": "powershell -ExecutionPolicy Bypass -File scripts/voice/smoke.ps1"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

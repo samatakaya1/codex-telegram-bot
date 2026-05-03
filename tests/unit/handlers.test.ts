@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { AppConfig } from '../../src/config/env.js';
+import { DEFAULT_VOICE_TRANSCRIPTION_CONFIG, type AppConfig } from '../../src/config/env.js';
 import type { CodexThread, JsonValue } from '../../src/codex/protocol.js';
 import type { PromptConfig } from '../../src/domain/promptConfigs.js';
 import { createTelegramHandlers, type TelegramHandlerContext } from '../../src/telegram/handlers.js';
@@ -21,7 +21,8 @@ function config(): AppConfig {
     projectsRoot: 'C:\\Workspace',
     promptConfigDir: 'prompt-configs',
     logLevel: 'info',
-    botRunMode: 'DEV'
+    botRunMode: 'DEV',
+    voiceTranscription: DEFAULT_VOICE_TRANSCRIPTION_CONFIG
   };
 }
 
@@ -41,6 +42,15 @@ function makeContext(overrides: Partial<TelegramHandlerContext> = {}) {
     ...overrides
   };
   return { ctx, replies, replyOptions };
+}
+
+function inlineButtons(replyOptions: unknown[]): Array<{ text: string; callback_data?: string; copy_text?: { text: string } }> {
+  return replyOptions.flatMap((options) => {
+    const candidate = options as {
+      reply_markup?: { inline_keyboard?: Array<Array<{ text: string; callback_data?: string; copy_text?: { text: string } }>> };
+    };
+    return candidate.reply_markup?.inline_keyboard?.flat() ?? [];
+  });
 }
 
 function dependencies() {
@@ -2037,5 +2047,506 @@ describe('telegram handlers', () => {
     expect(slash.replies.join('\n')).not.toContain('/chats');
     expect(slash.replies.join('\n')).not.toContain('/new_project_chat');
     expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects voice when local transcription is disabled before download', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({ config: config(), ...deps });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const { ctx, replies } = makeContext({
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 }
+    });
+
+    await handlers.handleVoice(ctx);
+
+    expect(replies.join('\n')).toContain('Voice transcription is disabled');
+    expect(deps.downloadVoiceFile).not.toHaveBeenCalled();
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthorized voice before download', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    const { ctx, replies } = makeContext({
+      fromId: 1,
+      chatId: 1,
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 }
+    });
+
+    await handlers.handleVoice(ctx);
+
+    expect(replies.join('\n')).toContain('Access denied');
+    expect(deps.downloadVoiceFile).not.toHaveBeenCalled();
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects owner voice in groups before download', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    const { ctx, replies } = makeContext({
+      chatId: -100,
+      chatType: 'group',
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 }
+    });
+
+    await handlers.handleVoice(ctx);
+
+    expect(replies.join('\n')).toContain('private chat');
+    expect(deps.downloadVoiceFile).not.toHaveBeenCalled();
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects voice with no selected chat before download', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    const { ctx, replies } = makeContext({
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 }
+    });
+
+    await handlers.handleVoice(ctx);
+
+    expect(replies.join('\n')).toContain('No chat selected');
+    expect(deps.downloadVoiceFile).not.toHaveBeenCalled();
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('shows a voice transcript preview and waits for confirmation before starting Codex', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const { ctx, replies, replyOptions } = makeContext({
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 }
+    });
+
+    await handlers.handleVoice(ctx);
+
+    expect(replies.join('\n')).toContain('Voice transcribed. Send this to Codex?');
+    expect(replies.join('\n')).toContain('hello from voice');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+    expect(deps.deleteVoiceFile).toHaveBeenCalledWith('C:\\tmp\\voice.ogg');
+
+    const buttons = inlineButtons(replyOptions);
+    const sendCallbackData = buttons.find((button) => button.text === 'Send to Codex')?.callback_data;
+    const copyButton = buttons.find((button) => button.text === 'Copy');
+    expect(copyButton?.copy_text?.text).toBe('hello from voice');
+    expect(sendCallbackData).toBeDefined();
+
+    await handlers.handleCallback(makeContext({ callbackData: sendCallbackData }).ctx);
+
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: 'hello from voice' });
+  });
+
+  it('unblocks the selected thread when sending the voice preview fails', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' })),
+      onDeliveryError: vi.fn()
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({
+      voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 },
+      reply: vi.fn(async (_text, options) => {
+        if (options !== undefined) {
+          throw new Error('preview failed');
+        }
+      })
+    });
+
+    await handlers.handleVoice(voice.ctx);
+    const text = makeContext({ text: 'text after failed preview' });
+    await handlers.handleText(text.ctx);
+
+    expect(deps.onDeliveryError).toHaveBeenCalledWith(expect.any(Error));
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: 'text after failed preview' });
+  });
+
+  it('reports empty voice transcripts without sending a generic setup error', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: '   ' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 1, fileSizeBytes: 10 } });
+
+    await handlers.handleVoice(voice.ctx);
+
+    expect(voice.replies.join('\n')).toContain('Voice transcription was empty. Please try again.');
+    expect(voice.replies.join('\n')).not.toContain('Check local voice setup');
+    expect(deps.deleteVoiceFile).toHaveBeenCalledWith('C:\\tmp\\voice.ogg');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('logs sanitized helper diagnostics for voice transcription failures', async () => {
+    const error = Object.assign(new Error('failed on C:\\secret\\voice.ogg'), {
+      name: 'VoiceTranscriptionError',
+      code: 'helper_failed',
+      details: {
+        helperErrorCode: 'audio_decode_failed',
+        helperErrorType: 'RuntimeError'
+      }
+    });
+    const logger = { warn: vi.fn() };
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => {
+        throw error;
+      }),
+      logger
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 1, fileSizeBytes: 10 } });
+
+    await handlers.handleVoice(voice.ctx);
+
+    expect(voice.replies.join('\n')).toContain('Could not transcribe this voice message');
+    expect(logger.warn).toHaveBeenCalledWith(
+      {
+        voiceTranscriptionError: {
+          name: 'VoiceTranscriptionError',
+          code: 'helper_failed',
+          helperErrorCode: 'audio_decode_failed',
+          helperErrorType: 'RuntimeError'
+        },
+        voiceAudio: {
+          hasDownloadedFile: true,
+          sizeBytes: 10,
+          kind: 'unknown'
+        }
+      },
+      'Voice transcription failed'
+    );
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret');
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('voice.ogg');
+    expect(deps.deleteVoiceFile).toHaveBeenCalledWith('C:\\tmp\\voice.ogg');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('keeps the thread reserved while a voice send callback is being acknowledged', async () => {
+    let releaseAnswerCallback: () => void = () => undefined;
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'confirmed transcript' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+    await handlers.handleVoice(voice.ctx);
+    const sendCallbackData = inlineButtons(voice.replyOptions).find((button) => button.text === 'Send to Codex')?.callback_data;
+    const confirm = makeContext({
+      callbackData: sendCallbackData,
+      answerCallbackQuery: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseAnswerCallback = resolve;
+          })
+      )
+    });
+
+    const confirmPromise = handlers.handleCallback(confirm.ctx);
+    await vi.waitFor(() => expect(confirm.ctx.answerCallbackQuery).toHaveBeenCalledTimes(1));
+
+    const text = makeContext({ text: 'second prompt during send ack' });
+    await handlers.handleText(text.ctx);
+
+    expect(text.replies.join('\n')).toContain('already running');
+    expect(deps.codex.startTurn).not.toHaveBeenCalledWith({ threadId: 'thread-1', text: 'second prompt during send ack' });
+
+    releaseAnswerCallback();
+    await confirmPromise;
+
+    expect(deps.codex.startTurn).toHaveBeenCalledTimes(1);
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: 'confirmed transcript' });
+  });
+
+  it('still starts the confirmed voice transcript if callback acknowledgement fails', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'confirmed transcript' })),
+      onDeliveryError: vi.fn()
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+    await handlers.handleVoice(voice.ctx);
+    const sendCallbackData = inlineButtons(voice.replyOptions).find((button) => button.text === 'Send to Codex')?.callback_data;
+
+    await handlers.handleCallback(
+      makeContext({
+        callbackData: sendCallbackData,
+        answerCallbackQuery: vi.fn(async () => {
+          throw new Error('callback ack failed');
+        })
+      }).ctx
+    );
+
+    expect(deps.onDeliveryError).toHaveBeenCalledWith(expect.any(Error));
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: 'confirmed transcript' });
+  });
+
+  it('blocks text while a voice transcript is awaiting confirmation', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    await handlers.handleVoice(
+      makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } }).ctx
+    );
+
+    const text = makeContext({ text: 'second prompt' });
+    await handlers.handleText(text.ctx);
+
+    expect(text.replies.join('\n')).toContain('already running');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('blocks a second voice while a voice transcript is awaiting confirmation', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    await handlers.handleVoice(
+      makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } }).ctx
+    );
+
+    const second = makeContext({ voice: { fileId: 'second-voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+    await handlers.handleVoice(second.ctx);
+
+    expect(second.replies.join('\n')).toContain('already running');
+    expect(deps.downloadVoiceFile).toHaveBeenCalledTimes(1);
+    expect(deps.transcribeVoice).toHaveBeenCalledTimes(1);
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('keeps the selected thread blocked for the configured helper timeout while voice transcription is running', async () => {
+    vi.useFakeTimers();
+    try {
+      let finishTranscription: () => void = () => undefined;
+      const deps = {
+        ...dependencies(),
+        downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+        deleteVoiceFile: vi.fn(async () => undefined),
+        transcribeVoice: vi.fn(
+          () =>
+            new Promise<{ text: string }>((resolve) => {
+              finishTranscription = () => resolve({ text: 'hello from voice' });
+            })
+        )
+      };
+      const handlers = createTelegramHandlers({
+        config: {
+          ...config(),
+          voiceTranscription: {
+            ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG,
+            enabled: true,
+            timeoutSeconds: 1200
+          }
+        },
+        ...deps
+      });
+      handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+      const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+
+      const voicePromise = handlers.handleVoice(voice.ctx);
+      await vi.waitFor(() => expect(deps.transcribeVoice).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000 + 1);
+
+      const text = makeContext({ text: 'second prompt' });
+      await handlers.handleText(text.ctx);
+
+      expect(text.replies.join('\n')).toContain('already running');
+      expect(deps.codex.startTurn).not.toHaveBeenCalled();
+
+      finishTranscription();
+      await voicePromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports oversized downloads discovered after Telegram metadata as too large', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => {
+        throw Object.assign(new Error('Voice file is too large.'), { code: 'file_too_large' });
+      }),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2 } });
+
+    await handlers.handleVoice(voice.ctx);
+
+    expect(voice.replies.join('\n')).toContain('Voice message is too large for local transcription.');
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects too-long voice metadata before download', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: {
+        ...config(),
+        voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true, maxDurationSeconds: 5 }
+      },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 6, fileSizeBytes: 10 } });
+
+    await handlers.handleVoice(voice.ctx);
+
+    expect(voice.replies.join('\n')).toContain('Voice message is too long for local transcription.');
+    expect(deps.downloadVoiceFile).not.toHaveBeenCalled();
+    expect(deps.transcribeVoice).not.toHaveBeenCalled();
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('cancels a pending voice transcript without starting Codex', async () => {
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: 'hello from voice' }))
+    };
+    const handlers = createTelegramHandlers({
+      config: { ...config(), voiceTranscription: { ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG, enabled: true } },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+    await handlers.handleVoice(voice.ctx);
+
+    const cancelCallbackData = inlineButtons(voice.replyOptions).find((button) => button.text === 'Cancel')?.callback_data;
+    const cancel = makeContext({ callbackData: cancelCallbackData });
+    await handlers.handleCallback(cancel.ctx);
+
+    expect(cancel.replies.join('\n')).toContain('Voice prompt cancelled');
+    expect(deps.codex.startTurn).not.toHaveBeenCalled();
+  });
+
+  it('truncates long Telegram voice previews while sending the full accepted transcript', async () => {
+    const fullTranscript = 'abcdefghijklmnopqrstuvwxyz'.repeat(12);
+    const deps = {
+      ...dependencies(),
+      downloadVoiceFile: vi.fn(async () => ({ path: 'C:\\tmp\\voice.ogg', sizeBytes: 10 })),
+      deleteVoiceFile: vi.fn(async () => undefined),
+      transcribeVoice: vi.fn(async () => ({ text: fullTranscript }))
+    };
+    const handlers = createTelegramHandlers({
+      config: {
+        ...config(),
+        voiceTranscription: {
+          ...DEFAULT_VOICE_TRANSCRIPTION_CONFIG,
+          enabled: true,
+          previewMaxChars: 10,
+          maxTextChars: 400
+        }
+      },
+      ...deps
+    });
+    handlers.setSelectedThread(ownerId, 'thread-1', 'C:\\Workspace\\Project');
+    const voice = makeContext({ voice: { fileId: 'voice-file', durationSeconds: 2, fileSizeBytes: 10 } });
+
+    await handlers.handleVoice(voice.ctx);
+
+    expect(voice.replies.join('\n')).toContain('Preview truncated for Telegram. Full transcript will be sent to Codex.');
+    expect(voice.replies.join('\n')).not.toContain(fullTranscript);
+    const copyButton = inlineButtons(voice.replyOptions).find((button) => button.text === 'Copy first 256');
+    expect(copyButton?.copy_text?.text).toBe(fullTranscript.slice(0, 256));
+    expect(copyButton?.copy_text?.text).toHaveLength(256);
+
+    const sendCallbackData = inlineButtons(voice.replyOptions).find((button) => button.text === 'Send to Codex')?.callback_data;
+    await handlers.handleCallback(makeContext({ callbackData: sendCallbackData }).ctx);
+
+    expect(deps.codex.startTurn).toHaveBeenCalledWith({ threadId: 'thread-1', text: fullTranscript });
   });
 });

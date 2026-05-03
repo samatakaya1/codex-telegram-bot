@@ -1,6 +1,7 @@
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import type { AppConfig } from '../config/env.js';
+import type { AppConfig, VoiceTranscriptionConfig } from '../config/env.js';
 import type { AgentMessageDeltaNotification, CodexThread, JsonValue, TurnCompletedNotification } from '../codex/protocol.js';
 import { TELEGRAM_APPROVAL_UNAVAILABLE_MESSAGE } from '../domain/approvals.js';
 import { splitTelegramText } from '../domain/messages.js';
@@ -8,6 +9,7 @@ import type { PromptConfig } from '../domain/promptConfigs.js';
 import type { ProjectSummary } from '../domain/projects.js';
 import { formatRateLimits } from '../domain/rateLimits.js';
 import { ActiveTurnStore } from '../domain/turns.js';
+import { isVoiceCallbackData, VoiceTurnStore } from '../domain/voiceTurns.js';
 import { DEFAULT_PROMPT_CONFIGS } from '../promptConfigs/defaults.js';
 import {
   readCodexSessionModelInfo,
@@ -26,17 +28,30 @@ export type TelegramHandlerContext = {
   chatId?: number;
   chatType?: string;
   text?: string;
+  voice?: TelegramVoiceMessage;
   callbackData?: string;
   reply: (text: string, options?: unknown) => Promise<void>;
   answerCallbackQuery?: (text?: string) => Promise<void> | void;
   confirmUpdate?: () => Promise<void> | void;
 };
 
+export type TelegramVoiceMessage = {
+  fileId: string;
+  fileUniqueId?: string;
+  durationSeconds: number;
+  mimeType?: string;
+  fileSizeBytes?: number;
+};
+
 type InlineKeyboardOption = {
   reply_markup: {
-    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    inline_keyboard: Array<Array<InlineKeyboardButtonOption>>;
   };
 };
+
+type InlineKeyboardButtonOption =
+  | { text: string; callback_data: string }
+  | { text: string; copy_text: { text: string } };
 
 type ConnectionStatusChangedEvent = {
   previousStatus: string;
@@ -63,6 +78,13 @@ export type TelegramHandlersDependencies = {
   listProjects: (root: string) => Promise<ProjectSummary[]>;
   callbackData?: CallbackDataStore;
   promptConfigs?: PromptConfigStore;
+  voiceTurns?: VoiceTurnStore;
+  downloadVoiceFile?: (params: { fileId: string; declaredSizeBytes?: number }) => Promise<{ path: string; sizeBytes: number }>;
+  deleteVoiceFile?: (path: string) => Promise<void>;
+  transcribeVoice?: (audioPath: string) => Promise<{ text: string; language?: string; durationSeconds?: number }>;
+  logger?: {
+    warn?: (payload: unknown, message?: string) => void;
+  };
   connectionLossGraceMs?: number;
   deliveryRetryAttempts?: number;
   deliveryRetryDelayMs?: number;
@@ -80,6 +102,15 @@ const DEFAULT_DELIVERY_RETRY_ATTEMPTS = 2;
 const DEFAULT_DELIVERY_RETRY_DELAY_MS = 250;
 const CODEX_CONNECTION_LOST_MESSAGE =
   'Codex app-server disconnected while processing this request. I will not resend it automatically. Check /status and retry if needed.';
+const VOICE_DISABLED_MESSAGE = 'Voice transcription is disabled. Enable VOICE_TRANSCRIPTION_ENABLED and run local voice setup first.';
+const VOICE_UNAVAILABLE_MESSAGE = 'Voice transcription is not configured. Run npm run voice:doctor and check local voice setup.';
+const VOICE_BUSY_MESSAGE = 'A Codex turn or voice prompt is already running for this chat. Wait for it to finish.';
+const VOICE_TRANSCRIPTION_FAILED_MESSAGE = 'Could not transcribe this voice message. Check local voice setup and try again.';
+const VOICE_EMPTY_MESSAGE = 'Voice transcription was empty. Please try again.';
+const VOICE_TOO_LARGE_MESSAGE = 'Voice message is too large for local transcription.';
+const VOICE_TOO_LONG_MESSAGE = 'Voice message is too long for local transcription.';
+const VOICE_TRANSCRIPTION_TTL_BUFFER_MS = 30 * 1000;
+const TELEGRAM_COPY_TEXT_MAX_CHARS = 256;
 const SUMMARY_CHAT_PROMPT =
   [
     'Provide a concise status summary of this current chat for Telegram.',
@@ -136,6 +167,11 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
   const selectedChats = new Map<number, SelectedChat>();
   const selectedProjects = new Map<number, string>();
   const activeTurns = new ActiveTurnStore();
+  const voiceTurns =
+    deps.voiceTurns ??
+    new VoiceTurnStore({
+      transcriptionTtlMs: voiceTranscriptionTtlMs(deps.config.voiceTranscription)
+    });
   const pendingTurnThreadIds = new Set<string>();
   const pendingTurnContexts = new Map<string, PendingTurnContext>();
   const connectionLossTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -195,6 +231,10 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     return selectedProjectPath(chatId) === undefined
       ? 'No chat selected. Use /select_project first, then /select_chat.'
       : 'No chat selected. Use /new_chat to create one or /select_chat to choose an existing chat.';
+  }
+
+  function isThreadUnavailable(threadId: string): boolean {
+    return pendingTurnThreadIds.has(threadId) || activeTurns.isThreadBusy(threadId) || voiceTurns.isThreadBlocked(threadId);
   }
 
   async function updateCommandMenu(chatId: number, hasChat: boolean): Promise<void> {
@@ -406,7 +446,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       return;
     }
 
-    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+    if (isThreadUnavailable(selected.threadId)) {
       await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before requesting /summary_chat.');
       return;
     }
@@ -450,7 +490,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       return;
     }
 
-    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+    if (isThreadUnavailable(selected.threadId)) {
       await safeReply(
         ctx,
         `A Codex turn is already running for this chat. Wait for it to finish before requesting ${options.command}.`
@@ -459,6 +499,14 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
 
     const pending = reservePendingTurn(ctx, selected);
+    if (pending === null) {
+      await safeReply(
+        ctx,
+        `A Codex turn is already running for this chat. Wait for it to finish before requesting ${options.command}.`
+      );
+      return;
+    }
+
     let config: PromptConfig | null;
     try {
       config = await promptConfigs.getPromptConfig(options.configId);
@@ -487,6 +535,11 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
   async function handleCallback(ctx: TelegramHandlerContext): Promise<void> {
     if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    if (isVoiceCallbackData(ctx.callbackData)) {
+      await handleVoiceConfirmationCallback(ctx);
       return;
     }
 
@@ -541,6 +594,181 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     await safeReply(ctx, 'This button expired. Run the command again.');
   }
 
+  async function handleVoice(ctx: TelegramHandlerContext): Promise<void> {
+    if (!(await requireAccess(ctx))) {
+      return;
+    }
+
+    if (!deps.config.voiceTranscription.enabled) {
+      await safeReply(ctx, VOICE_DISABLED_MESSAGE);
+      return;
+    }
+
+    if (deps.downloadVoiceFile === undefined || deps.transcribeVoice === undefined) {
+      await safeReply(ctx, VOICE_UNAVAILABLE_MESSAGE);
+      return;
+    }
+
+    const selected = selectedChats.get(ownerChatKey(ctx));
+    if (selected === undefined) {
+      await safeReply(ctx, noChatSelectedMessage(ownerChatKey(ctx)));
+      return;
+    }
+
+    if (isThreadUnavailable(selected.threadId)) {
+      await safeReply(ctx, VOICE_BUSY_MESSAGE);
+      return;
+    }
+
+    const voice = ctx.voice;
+    if (voice === undefined) {
+      await safeReply(ctx, 'No voice message found.');
+      return;
+    }
+
+    const maxFileBytes = deps.config.voiceTranscription.maxFileMb * 1024 * 1024;
+    if (voice.fileSizeBytes !== undefined && voice.fileSizeBytes > maxFileBytes) {
+      await safeReply(ctx, VOICE_TOO_LARGE_MESSAGE);
+      return;
+    }
+
+    if (voice.durationSeconds > deps.config.voiceTranscription.maxDurationSeconds) {
+      await safeReply(ctx, VOICE_TOO_LONG_MESSAGE);
+      return;
+    }
+
+    const transcription = voiceTurns.beginTranscription({ threadId: selected.threadId, telegramChatId: ownerChatKey(ctx) });
+    if (transcription === null) {
+      await safeReply(ctx, VOICE_BUSY_MESSAGE);
+      return;
+    }
+
+    let downloadedPath: string | undefined;
+    let downloadedSizeBytes: number | undefined;
+    try {
+      const downloaded = await deps.downloadVoiceFile({
+        fileId: voice.fileId,
+        declaredSizeBytes: voice.fileSizeBytes
+      });
+      downloadedPath = downloaded.path;
+      downloadedSizeBytes = downloaded.sizeBytes;
+      const transcript = await deps.transcribeVoice(downloaded.path);
+      if (
+        transcript.durationSeconds !== undefined &&
+        transcript.durationSeconds > deps.config.voiceTranscription.maxDurationSeconds
+      ) {
+        if (!voiceTurns.clearTranscription(selected.threadId, transcription.id)) {
+          return;
+        }
+        await safeReply(ctx, VOICE_TOO_LONG_MESSAGE);
+        return;
+      }
+
+      const text = transcript.text.trim();
+      if (text.length === 0) {
+        if (!voiceTurns.clearTranscription(selected.threadId, transcription.id)) {
+          return;
+        }
+        await safeReply(ctx, VOICE_EMPTY_MESSAGE);
+        return;
+      }
+
+      if (text.length > deps.config.voiceTranscription.maxTextChars) {
+        if (!voiceTurns.clearTranscription(selected.threadId, transcription.id)) {
+          return;
+        }
+        await safeReply(ctx, 'Voice transcript is too long to send to Codex.');
+        return;
+      }
+
+      const confirmation = voiceTurns.awaitConfirmation({
+        threadId: selected.threadId,
+        telegramChatId: ownerChatKey(ctx),
+        transcript: text,
+        transcriptionId: transcription.id
+      });
+      if (confirmation === null) {
+        return;
+      }
+      const previewSent = await tryReply(ctx, formatVoiceConfirmationPreview(text, deps.config.voiceTranscription), keyboard([
+        [{ text: 'Send to Codex', callback_data: confirmation.sendCallbackData }],
+        [voiceCopyButton(text)],
+        [{ text: 'Cancel', callback_data: confirmation.cancelCallbackData }]
+      ]));
+      if (!previewSent) {
+        voiceTurns.clearConfirmation(selected.threadId, confirmation.id);
+      }
+    } catch (error) {
+      if (!voiceTurns.clearTranscription(selected.threadId, transcription.id)) {
+        return;
+      }
+      deps.logger?.warn?.(
+        {
+          voiceTranscriptionError: sanitizeVoiceTranscriptionError(error),
+          voiceAudio: {
+            hasDownloadedFile: downloadedPath !== undefined,
+            sizeBytes: downloadedSizeBytes,
+            kind: downloadedPath === undefined ? undefined : await readVoiceAudioKind(downloadedPath)
+          }
+        },
+        'Voice transcription failed'
+      );
+      await safeReply(ctx, voiceTranscriptionFailureMessage(error));
+    } finally {
+      if (downloadedPath !== undefined) {
+        await deleteVoiceFile(downloadedPath);
+      }
+    }
+  }
+
+  async function handleVoiceConfirmationCallback(ctx: TelegramHandlerContext): Promise<void> {
+    const consumed = voiceTurns.consume(ctx.callbackData);
+    if (consumed === null) {
+      await answerCallback(ctx, 'Expired');
+      await safeReply(ctx, 'This voice prompt expired. Send the voice message again.');
+      return;
+    }
+
+    if (consumed.telegramChatId !== ownerChatKey(ctx)) {
+      await answerCallback(ctx, 'Expired');
+      await safeReply(ctx, 'This voice prompt no longer matches this chat.');
+      return;
+    }
+
+    if (consumed.action === 'cancel') {
+      await answerCallback(ctx, 'Cancelled');
+      await safeReply(ctx, 'Voice prompt cancelled.');
+      return;
+    }
+
+    const selected = selectedChats.get(ownerChatKey(ctx));
+    if (selected === undefined || selected.threadId !== consumed.threadId) {
+      await answerCallback(ctx, 'Expired');
+      await safeReply(ctx, 'This voice prompt no longer matches the selected chat.');
+      return;
+    }
+
+    if (isThreadUnavailable(consumed.threadId)) {
+      await answerCallback(ctx, 'Busy');
+      await safeReply(ctx, VOICE_BUSY_MESSAGE);
+      return;
+    }
+
+    const pending = reservePendingTurn(ctx, selected);
+    if (pending === null) {
+      await answerCallback(ctx, 'Busy');
+      await safeReply(ctx, VOICE_BUSY_MESSAGE);
+      return;
+    }
+
+    try {
+      await answerCallback(ctx, 'Sending');
+    } catch (error) {
+      reportDeliveryError(error);
+    }
+    await startReservedCodexTurn(ctx, selected, pending, consumed.transcript, 'Codex is working...');
+  }
+
   async function handleText(ctx: TelegramHandlerContext): Promise<void> {
     if (!(await requireAccess(ctx))) {
       return;
@@ -563,7 +791,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       return;
     }
 
-    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+    if (isThreadUnavailable(selected.threadId)) {
       await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish.');
       return;
     }
@@ -814,7 +1042,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
       return;
     }
 
-    if (pendingTurnThreadIds.has(deleteConfirm.threadId) || activeTurns.isThreadBusy(deleteConfirm.threadId)) {
+    if (isThreadUnavailable(deleteConfirm.threadId)) {
       await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish before deleting it.');
       return;
     }
@@ -942,10 +1170,18 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     workingMessage = 'Codex is working...'
   ): Promise<void> {
     const pending = reservePendingTurn(ctx, selected);
+    if (pending === null) {
+      await safeReply(ctx, 'A Codex turn is already running for this chat. Wait for it to finish.');
+      return;
+    }
     await startReservedCodexTurn(ctx, selected, pending, text, workingMessage);
   }
 
-  function reservePendingTurn(ctx: TelegramHandlerContext, selected: SelectedChat): PendingTurnContext {
+  function reservePendingTurn(ctx: TelegramHandlerContext, selected: SelectedChat): PendingTurnContext | null {
+    if (pendingTurnThreadIds.has(selected.threadId) || activeTurns.isThreadBusy(selected.threadId)) {
+      return null;
+    }
+
     const chatId = ownerChatKey(ctx);
     const pending: PendingTurnContext = {
       threadId: selected.threadId,
@@ -1097,8 +1333,22 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     }
   }
   async function safeReply(ctx: TelegramHandlerContext, text: string, options?: unknown): Promise<void> {
+    await tryReply(ctx, text, options);
+  }
+
+  async function tryReply(ctx: TelegramHandlerContext, text: string, options?: unknown): Promise<boolean> {
     try {
       await ctx.reply(text, options);
+      return true;
+    } catch (error) {
+      reportDeliveryError(error);
+      return false;
+    }
+  }
+
+  async function deleteVoiceFile(filePath: string): Promise<void> {
+    try {
+      await Promise.resolve(deps.deleteVoiceFile?.(filePath));
     } catch (error) {
       reportDeliveryError(error);
     }
@@ -1142,6 +1392,7 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
     handleReviewFix,
     handleCommit,
     handleCallback,
+    handleVoice,
     handleText,
     handleReboot,
     getSelectedThread(chatId: number): string | null {
@@ -1161,6 +1412,15 @@ export function createTelegramHandlers(deps: TelegramHandlersDependencies) {
 
 function keyboard(rows: InlineKeyboardOption['reply_markup']['inline_keyboard']): InlineKeyboardOption {
   return { reply_markup: { inline_keyboard: rows } };
+}
+
+function voiceCopyButton(text: string): InlineKeyboardButtonOption {
+  const characters = Array.from(text);
+  const copyText = characters.slice(0, TELEGRAM_COPY_TEXT_MAX_CHARS).join('');
+  return {
+    text: characters.length > TELEGRAM_COPY_TEXT_MAX_CHARS ? 'Copy first 256' : 'Copy',
+    copy_text: { text: copyText }
+  };
 }
 
 function nameFromThread(thread: CodexThread): string | undefined {
@@ -1228,8 +1488,93 @@ function formatCurrentChat(selectedChat: SelectedChat): string {
   return lines.join('\n');
 }
 
+function formatVoiceConfirmationPreview(text: string, config: Pick<VoiceTranscriptionConfig, 'previewMaxChars'>): string {
+  const normalized = text.trim();
+  if (normalized.length <= config.previewMaxChars) {
+    return `Voice transcribed. Send this to Codex?\n\n${normalized}`;
+  }
+
+  return [
+    'Voice transcribed. Send this to Codex?',
+    '',
+    normalized.slice(0, config.previewMaxChars),
+    '',
+    'Preview truncated for Telegram. Full transcript will be sent to Codex.'
+  ].join('\n');
+}
+
 function truncateLabel(value: string): string {
   return value.length <= MAX_LABEL_LENGTH ? value : `${value.slice(0, MAX_LABEL_LENGTH - 3)}...`;
+}
+
+function voiceTranscriptionTtlMs(config: Pick<VoiceTranscriptionConfig, 'timeoutSeconds'>): number {
+  return config.timeoutSeconds * 1000 + VOICE_TRANSCRIPTION_TTL_BUFFER_MS;
+}
+
+function isVoiceFileTooLargeError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'file_too_large';
+}
+
+function isVoiceEmptyTranscriptError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'empty_transcript';
+}
+
+function voiceTranscriptionFailureMessage(error: unknown): string {
+  if (isVoiceFileTooLargeError(error)) {
+    return VOICE_TOO_LARGE_MESSAGE;
+  }
+  if (isVoiceEmptyTranscriptError(error)) {
+    return VOICE_EMPTY_MESSAGE;
+  }
+  return VOICE_TRANSCRIPTION_FAILED_MESSAGE;
+}
+
+function sanitizeVoiceTranscriptionError(error: unknown): {
+  name: string;
+  code?: string;
+  helperErrorCode?: string;
+  helperErrorType?: string;
+} {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined;
+  const details = typeof error === 'object' && error !== null && 'details' in error ? error.details : undefined;
+  const helperErrorCode =
+    typeof details === 'object' && details !== null && 'helperErrorCode' in details && typeof details.helperErrorCode === 'string'
+      ? details.helperErrorCode
+      : undefined;
+  const helperErrorType =
+    typeof details === 'object' && details !== null && 'helperErrorType' in details && typeof details.helperErrorType === 'string'
+      ? details.helperErrorType
+      : undefined;
+  return { name, code, helperErrorCode, helperErrorType };
+}
+
+async function readVoiceAudioKind(filePath: string): Promise<'empty' | 'html' | 'json' | 'ogg' | 'unknown'> {
+  try {
+    const bytes = await readFile(filePath);
+    if (bytes.length === 0) {
+      return 'empty';
+    }
+
+    const prefix = bytes.subarray(0, 8);
+    const ascii = prefix.toString('ascii').trimStart();
+    if (prefix.subarray(0, 4).toString('ascii') === 'OggS') {
+      return 'ogg';
+    }
+    if (ascii.startsWith('<')) {
+      return 'html';
+    }
+    if (ascii.startsWith('{') || ascii.startsWith('[')) {
+      return 'json';
+    }
+  } catch {
+    return 'unknown';
+  }
+
+  return 'unknown';
 }
 
 function singleLine(value: string): string {

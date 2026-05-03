@@ -4,6 +4,7 @@ logs/
 .tmp/
 tmp/
 .worktrees/
+.local/
 prompt-configs/
 
 # Local environment
